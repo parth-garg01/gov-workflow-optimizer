@@ -4,11 +4,23 @@ import pandas as pd
 import streamlit as st
 import plotly.express as px
 import plotly.graph_objects as go
+import joblib
+import numpy as np
+
+# ---------- Model loading ----------
+@st.cache_resource
+def load_models():
+    # models are saved in project_root/src/models/*.pkl
+    models_dir = Path(__file__).resolve().parents[2] / "src" / "models"
+    reg_path = models_dir / "processing_time_model.pkl"
+    cls_path = models_dir / "delay_risk_model.pkl"
+    reg = joblib.load(reg_path)
+    cls = joblib.load(cls_path)
+    return reg, cls
 
 # ---------- Helpers ----------
 @st.cache_data
 def load_data():
-    # robust path: go up from this file to project root and find data/synthetic_files.csv
     data_path = Path(__file__).resolve().parents[2] / "data" / "synthetic_files.csv"
     df = pd.read_csv(data_path, parse_dates=["submission_date"])
     return df
@@ -21,17 +33,52 @@ def top_kpi(df):
     return total, avg_hours, delayed_count, avg_delay_ratio
 
 def extract_first_stage(routing_str):
-    # routing_path like "Clerk->Officer->SectionHead"
     try:
         return str(routing_str).split("->")[0]
     except:
         return "Unknown"
 
+def prepare_row_for_prediction(row):
+    """
+    Receive a pandas Series or dict representing the file and return a DataFrame row
+    matching the features used in training (columns except targets).
+    """
+    # The training pipeline used all columns except these:
+    drop_cols = ["file_id", "submission_date", "processing_time_hours", "processing_time_days", "delayed", "delay_ratio"]
+    # If row is a Series with full df columns, drop the unwanted columns
+    if isinstance(row, pd.Series):
+        X = row.drop(labels=[c for c in drop_cols if c in row.index], errors="ignore").to_frame().T
+    elif isinstance(row, dict):
+        # Create a DataFrame and drop missing targets
+        X = pd.DataFrame([row])
+        X = X[[c for c in X.columns if c not in drop_cols]]
+    else:
+        X = pd.DataFrame([row])
+    return X
+
+def predict_for_row(reg, cls, row):
+    X = prepare_row_for_prediction(row)
+    # Ensure numeric types are numeric (simple cast)
+    for c in X.select_dtypes(include=['float64','int64','object']):
+        pass
+    # Predictions
+    pred_hours = float(reg.predict(X)[0])
+    # classification probability for class 'Delayed' (assumes pipeline supports predict_proba)
+    prob = None
+    try:
+        prob = float(cls.predict_proba(X)[0][1])
+    except Exception:
+        # fallback to predicted label (0/1)
+        prob = float(cls.predict(X)[0])
+    return pred_hours, prob
+
 # ---------- App UI ----------
 st.set_page_config(page_title="Gov File Workflow Dashboard", layout="wide")
-st.title("AI Workflow Optimization — Dashboard (Mockup)")
+st.title("AI Workflow Optimization — Dashboard (Model Integration)")
 
+# Load data and models
 df = load_data()
+reg_model, cls_model = load_models()
 
 # Sidebar filters
 st.sidebar.header("Filters")
@@ -126,23 +173,70 @@ st.plotly_chart(fig_heat, use_container_width=True)
 
 st.markdown("---")
 
+# ---------- Prediction UI ----------
+st.subheader("Predict processing time & delay risk for a file")
+
+# Choose an existing file
+file_options = df_f["file_id"].tolist()
+selected = st.selectbox("Pick a file (filtered view)", options=file_options)
+
+if selected:
+    row = df.loc[df["file_id"] == selected].iloc[0]
+    st.write("**File details (selected):**")
+    st.write({
+        "file_id": row["file_id"],
+        "department": row["department"],
+        "file_type": row["file_type"],
+        "priority": row["priority"],
+        "num_pages": int(row["num_pages"]),
+        "complexity_score": float(row["complexity_score"]),
+        "required_approvals": int(row["required_approvals"])
+    })
+
+    if st.button("Predict for selected file"):
+        pred_hours, prob = predict_for_row(reg_model, cls_model, row)
+        st.success(f"Predicted processing time: {pred_hours:.2f} hours ({pred_hours/24:.2f} days)")
+        st.info(f"Predicted delay probability: {prob*100:.1f}%")
+
+st.markdown("---")
+
 # File list / table with simple actions
 st.subheader("Files (sample)")
 display_cols = ["file_id", "department", "file_type", "priority", "submission_date",
                 "processing_time_hours", "delayed", "assigned_officer_id", "current_backlog_officer"]
 st.dataframe(df_f[display_cols].sort_values(by="submission_date", ascending=False).head(200), use_container_width=True)
 
-# Upload new file (basic) - placeholder for API integration later
+# Upload new file (basic) - integrated with prediction
 st.sidebar.markdown("---")
-st.sidebar.subheader("Add new file (manual)")
+st.sidebar.subheader("Add new file (manual & predict)")
 with st.sidebar.form("add_file"):
     new_ftype = st.selectbox("File type", ["application", "permit", "appeal", "report"])
     new_dept = st.selectbox("Department", sorted(df["department"].unique()))
     new_priority = st.selectbox("Priority", ["Low", "Medium", "High"])
     new_pages = st.number_input("Num pages", value=5, min_value=1)
     new_complex = st.slider("Complexity (0-1)", 0.0, 1.0, 0.2, 0.01)
-    submit = st.form_submit_button("Add (mock)")
+    new_approvals = st.number_input("Required approvals", value=1, min_value=1, max_value=10)
+    new_officer = st.text_input("Assigned officer id", value="OFF001")
+    new_experience = st.number_input("Officer experience (yrs)", value=2.0, min_value=0.0, step=0.1)
+    new_backlog = st.number_input("Officer backlog", value=5, min_value=0)
+    submit = st.form_submit_button("Add (mock & predict)")
 if submit:
-    st.sidebar.success("File added (mock). In next step we'll wire this to FastAPI + model prediction.")
+    new_row = {
+        "department": new_dept,
+        "file_type": new_ftype,
+        "priority": new_priority,
+        "complexity_score": float(new_complex),
+        "num_pages": int(new_pages),
+        "required_approvals": int(new_approvals),
+        "assigned_officer_id": new_officer,
+        "officer_experience_years": float(new_experience),
+        "current_backlog_officer": int(new_backlog),
+        "routing_path": "Clerk->Officer",
+        "sla_days": 7
+    }
+    pred_hours, prob = predict_for_row(reg_model, cls_model, new_row)
+    st.sidebar.success(f"Predicted processing time: {pred_hours:.2f} hrs ({pred_hours/24:.2f} days)")
+    st.sidebar.info(f"Predicted delay probability: {prob*100:.1f}%")
+    # Note: We are not appending to the CSV here (mock); later we can POST to FastAPI to add persistent file.
 
-st.markdown("**Note:** This is a prototype mockup for visualization and manual testing. Next steps: wire to FastAPI endpoints, add live predictions, and include stage-level timing traces for Gantt/Sankey visualizations.")
+st.markdown("**Note:** Predictions are from local models saved in `src/models/`. Next steps: show predictions in the main file table and optionally persist new files via FastAPI.")
