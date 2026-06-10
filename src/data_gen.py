@@ -128,30 +128,35 @@ def generate_dataset(
         # ---- SLA and routing ----
         sla_days     = SLA_MAP[ftype][priority]
         routing_path = "->".join(STAGES[: min(len(STAGES), 1 + required_approvals)])
+        # sla_hours computed inside processing-time block below
 
         # ---- Processing time formula ----
-        base_hours = (
-            2.0
-            + 0.6 * num_pages
-            + 12.0 * complexity_score
-            + 9.0 * (required_approvals - 1)
-        )
+        # Scale base hours so they realistically occupy 30-80% of SLA window.
+        # Government files rarely close in hours; typical unit is working-days.
+        sla_hours = sla_days * 24
+        base_fraction = float(rng.beta(3, 4))          # peaks around 0.43 of SLA
+        base_hours = base_fraction * sla_hours
 
-        # Modifiers
-        backlog_penalty      = 0.25 * current_backlog
-        exp_reduction        = max(0.0, (officer_exp - 1.5) * -1.8)
-        priority_adj         = {"Low": 1.0, "Medium": 0.88, "High": 0.72}[priority]
-        dept_mult            = DEPT_FACTOR[dept]
-        region_mult          = REGION_FACTOR[region]
-        month_mult           = MONTH_FACTOR[month]
-        weekday_mult         = WEEKDAY_FACTOR[weekday]
-        online_factor        = 0.88 if online_submission else 1.0
-        incomplete_factor    = 1.45 if incomplete_docs   else 1.0
-        resubmission_factor  = 1.25 if resubmission      else 1.0
-        escalation_factor    = 1.35 if escalated         else 1.0
+        # Feature-driven deltas (hours added or removed relative to base)
+        complexity_delta    = complexity_score * 0.30 * sla_hours
+        pages_delta         = (num_pages / 50.0) * 0.10 * sla_hours
+        approvals_delta     = (required_approvals - 1) * 0.08 * sla_hours
+        backlog_delta       = (current_backlog / 100.0) * 0.12 * sla_hours
+        exp_reduction       = max(0.0, (officer_exp - 2.0) * -0.04 * sla_hours)
+
+        priority_adj        = {"Low": 1.0, "Medium": 0.90, "High": 0.75}[priority]
+        dept_mult           = DEPT_FACTOR[dept]
+        region_mult         = REGION_FACTOR[region]
+        month_mult          = MONTH_FACTOR[month]
+        weekday_mult        = WEEKDAY_FACTOR[weekday]
+        online_factor       = 0.85 if online_submission else 1.0
+        incomplete_factor   = 1.50 if incomplete_docs   else 1.0
+        resubmission_factor = 1.30 if resubmission      else 1.0
+        escalation_factor   = 1.40 if escalated         else 1.0
 
         combined = (
-            (base_hours + backlog_penalty + exp_reduction)
+            (base_hours + complexity_delta + pages_delta + approvals_delta
+             + backlog_delta + exp_reduction)
             * priority_adj
             * dept_mult
             * region_mult
@@ -163,28 +168,27 @@ def generate_dataset(
             * escalation_factor
         )
 
-        # Heteroscedastic noise: variance proportional to combined (realistic)
-        noise_std = 0.15 * combined + 5.0
+        # Heteroscedastic noise proportional to combined (realistic variance)
+        noise_std = 0.18 * combined + 3.0
         noise     = float(rng.normal(0, noise_std))
 
-        # 1% chance of extreme outlier (bureaucratic bottleneck, lost file, etc.)
-        if rng.random() < 0.01:
-            noise += float(rng.uniform(50, 200))
+        # 1.5% extreme-outlier: lost file / bureaucratic bottleneck
+        if rng.random() < 0.015:
+            noise += float(rng.uniform(0.3 * sla_hours, 1.5 * sla_hours))
 
         processing_time_hours = float(max(1.0, combined + noise))
-        sla_hours             = sla_days * 24
         delay_ratio           = processing_time_hours / max(1, sla_hours)
 
-        # Delay: based on delay_ratio but with additional independent factors
-        # This ensures the classifier has to learn a non-trivial decision boundary
-        base_delay_prob = 1.0 / (1.0 + np.exp(-5.0 * (delay_ratio - 0.75)))
+        # Delay: logistic on delay_ratio with threshold=0.85 (>85% of SLA = at risk)
+        # plus independent bump from quality/process flags
+        base_delay_prob = 1.0 / (1.0 + np.exp(-6.0 * (delay_ratio - 0.85)))
         adj_delay_prob  = float(np.clip(
             base_delay_prob
-            + 0.12 * incomplete_docs
-            + 0.08 * resubmission
-            + 0.06 * escalated
-            - 0.05 * online_submission
-            + 0.001 * current_backlog,
+            + 0.14 * incomplete_docs
+            + 0.09 * resubmission
+            + 0.07 * escalated
+            - 0.06 * online_submission
+            + 0.002 * current_backlog,
             0.01, 0.99,
         ))
         delayed = bool(rng.random() < adj_delay_prob)
