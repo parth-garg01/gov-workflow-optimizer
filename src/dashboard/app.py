@@ -627,6 +627,38 @@ with tab_analytics:
         )
         st.plotly_chart(fig_off, use_container_width=True)
 
+        # --- Boolean flag impact ---
+        bool_flags = [c for c in ["online_submission","incomplete_docs","resubmission","escalated"]
+                      if c in df_f.columns]
+        if bool_flags:
+            st.markdown('<p class="section-header">Process Flag Impact on Delay Rate</p>', unsafe_allow_html=True)
+            flag_rows = []
+            for flag in bool_flags:
+                for val in [0, 1]:
+                    sub = df_f[df_f[flag] == val]
+                    if len(sub) > 0:
+                        flag_rows.append({
+                            "Flag":       flag.replace("_", " ").title(),
+                            "Value":      "Yes" if val == 1 else "No",
+                            "Delay Rate": sub["delayed"].astype(int).mean() * 100,
+                            "Count":      len(sub),
+                        })
+            flag_df = pd.DataFrame(flag_rows)
+            fig_flags = px.bar(
+                flag_df, x="Flag", y="Delay Rate", color="Value",
+                barmode="group",
+                color_discrete_map={"Yes": "#ef4444", "No": "#22c55e"},
+                text=flag_df["Delay Rate"].round(1),
+                labels={"Delay Rate": "Delay Rate %"},
+            )
+            fig_flags.update_traces(texttemplate="%{text}%", textposition="outside")
+            fig_flags.update_layout(
+                plot_bgcolor="#0f172a", paper_bgcolor="#0f172a",
+                font_color="#94a3b8", height=300,
+                margin=dict(l=10, r=10, t=30, b=10),
+            )
+            st.plotly_chart(fig_flags, use_container_width=True)
+
         # --- Correlation heatmap ---
         st.markdown('<p class="section-header">Feature Correlation Matrix</p>', unsafe_allow_html=True)
         num_cols_heatmap = [
