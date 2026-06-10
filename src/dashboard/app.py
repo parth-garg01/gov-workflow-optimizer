@@ -334,8 +334,7 @@ FEATURE_COLS: list[str] = feature_cols_from_model or [
 # ===========================================================================
 
 with st.sidebar:
-    st.image("https://img.icons8.com/fluency/48/government.png", width=42)
-    st.markdown("## FlowGov AI")
+    st.markdown("## 🏛️ FlowGov AI")
     st.markdown("*Government Workflow Intelligence*")
     st.divider()
 
