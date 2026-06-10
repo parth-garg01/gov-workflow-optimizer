@@ -277,7 +277,7 @@ def compute_and_save_importance(
         "importance_std":  result.importances_std,
     }).sort_values("importance_mean", ascending=False).reset_index(drop=True)
     fi_df.to_csv(out_path, index=False)
-    print(f"Feature importance saved → {out_path.name}")
+    print(f"Feature importance saved: {out_path.name}")
     return fi_df
 
 
@@ -289,13 +289,9 @@ def main() -> None:
     df = load_dataset()
     X, y_reg, y_cls, cat_cols, num_cols, feature_cols = build_feature_sets(df)
 
-    # --- Regression split ---
-    X_train, X_val, y_reg_train, y_reg_val = train_test_split(
-        X, y_reg, test_size=0.20, random_state=42,
-    )
-    # --- Classification split (stratified) ---
-    _, _, y_cls_train, y_cls_val = train_test_split(
-        X, y_cls, test_size=0.20, random_state=42, stratify=y_cls,
+    # Single stratified split — same row indices for both targets
+    X_train, X_val, y_reg_train, y_reg_val, y_cls_train, y_cls_val = train_test_split(
+        X, y_reg, y_cls, test_size=0.20, random_state=42, stratify=y_cls,
     )
 
     # --- Train ---
@@ -306,11 +302,7 @@ def main() -> None:
         cat_cols, num_cols, X_train, y_cls_train, X_val, y_cls_val,
     )
 
-    # --- Cross-validation (on full dataset for robust estimate) ---
-    # Use a fresh pipeline instance for CV so the held-out val set stays clean
-    _, _, fresh_reg_metrics = train_regression_model(
-        cat_cols, num_cols, X_train, y_reg_train, X_val, y_reg_val,
-    )
+    # --- Cross-validation (full dataset, robust estimate) ---
     reg_cv = run_cross_validation(lgbm_reg, X, y_reg, cv_type="regression")
     cls_cv = run_cross_validation(cls_pipe, X, y_cls, cv_type="classification")
 
@@ -354,8 +346,8 @@ def main() -> None:
     joblib.dump(reg_artifact, reg_path)
     joblib.dump(cls_artifact, cls_path)
 
-    print(f"\nSaved regression model  → {reg_path}")
-    print(f"Saved classification model → {cls_path}")
+    print(f"\nSaved regression model  : {reg_path}")
+    print(f"Saved classification model : {cls_path}")
     print(f"\nTraining complete.  trained_at={trained_at}")
     print(f"\n--- Final metrics ---")
     print(f"Regression  R²: {reg_metrics['r2']:.4f}  RMSE: {reg_metrics['rmse']:.2f}")
