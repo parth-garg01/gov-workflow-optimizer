@@ -168,12 +168,15 @@ def generate_dataset(
             * escalation_factor
         )
 
-        # Heteroscedastic noise proportional to combined (realistic variance)
-        noise_std = 0.18 * combined + 3.0
+        # Heteroscedastic noise — reduced from 18% to 8% of combined.
+        # EDA showed 30h noise on a 150h file created a 22% ambiguous zone
+        # where delay_ratio sits between 0.7-1.0 with only 52% delay rate
+        # (essentially a coin flip). Lower noise sharpens the decision boundary.
+        noise_std = 0.08 * combined + 2.0
         noise     = float(rng.normal(0, noise_std))
 
-        # 1.5% extreme-outlier: lost file / bureaucratic bottleneck
-        if rng.random() < 0.015:
+        # 1% extreme-outlier: lost file / bureaucratic bottleneck (reduced from 1.5%)
+        if rng.random() < 0.010:
             noise += float(rng.uniform(0.3 * sla_hours, 1.5 * sla_hours))
 
         processing_time_hours = float(max(1.0, combined + noise))
