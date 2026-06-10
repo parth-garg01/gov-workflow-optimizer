@@ -659,6 +659,26 @@ with tab_analytics:
             )
             st.plotly_chart(fig_flags, use_container_width=True)
 
+        # --- Top officers by delay rate (min 20 files) ---
+        st.markdown('<p class="section-header">Officers with Highest Delay Rate (min 20 files)</p>', unsafe_allow_html=True)
+        officer_risk = officer_agg[officer_agg["total"] >= 20].nlargest(10, "delay_rate")[
+            ["assigned_officer_id","total","delayed_count","delay_rate","avg_hours","avg_exp"]
+        ].rename(columns={
+            "assigned_officer_id": "Officer",
+            "total": "Files",
+            "delayed_count": "Delayed",
+            "delay_rate": "Delay %",
+            "avg_hours": "Avg Hrs",
+            "avg_exp": "Avg Exp Yrs",
+        })
+        officer_risk["Delay %"]   = officer_risk["Delay %"].round(1)
+        officer_risk["Avg Hrs"]   = officer_risk["Avg Hrs"].round(1)
+        officer_risk["Avg Exp Yrs"] = officer_risk["Avg Exp Yrs"].round(1)
+        st.dataframe(
+            officer_risk.style.background_gradient(subset=["Delay %"], cmap="RdYlGn_r"),
+            use_container_width=True, hide_index=True,
+        )
+
         # --- Correlation heatmap ---
         st.markdown('<p class="section-header">Feature Correlation Matrix</p>', unsafe_allow_html=True)
         num_cols_heatmap = [
