@@ -117,6 +117,22 @@ DATA_FILE = "government_files.csv"
 CHART_COLORS = px.colors.qualitative.Set2
 DELAY_COLOR  = {"Delayed": "#ef4444", "On-time": "#22c55e"}
 
+DARK_LAYOUT = dict(
+    plot_bgcolor="#0f172a",
+    paper_bgcolor="#0f172a",
+    font_color="#94a3b8",
+    margin=dict(l=10, r=10, t=30, b=10),
+    xaxis=dict(gridcolor="#1e293b", zeroline=False),
+    yaxis=dict(gridcolor="#1e293b", zeroline=False),
+)
+
+
+def dark_layout(height=320, **extra) -> dict:
+    layout = dict(DARK_LAYOUT)
+    layout["height"] = height
+    layout.update(extra)
+    return layout
+
 # ---------------------------------------------------------------------------
 # Resource / data loaders
 # ---------------------------------------------------------------------------
