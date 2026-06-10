@@ -1,21 +1,7 @@
 # src/dashboard/app.py
-#
-# Fixes applied vs original:
-#   1.  load_models() now loads the new dict-artifact format {model, feature_cols, ...}
-#       and exposes feature_cols so prediction helpers don't need to re-read the CSV.
-#   2.  load_feature_importance() gracefully handles missing CSV files (warns instead of crash).
-#   3.  FEATURE_DROP_COLS + NUMERIC_CAST_COLS defined once as module constants — DRY fix.
-#   4.  prepare_row_for_prediction() and predict_batch() receive feature_cols as a param.
-#   5.  predict_batch() fall-back uses "replace" not "overwrite" for SQLite if_exists.
-#   6.  top_kpi() guards against empty DataFrame (avoids int(NaN) ValueError).
-#   7.  Sidebar selectbox guarded: shown only when df_f is non-empty.
-#   8.  mask built with pd.Series(True, index=df.index) — no RangeIndex alignment risk.
-#   9.  Batch predictions stored in st.session_state so download buttons survive re-runs.
-#   10. pie chart shows "Delayed" / "On-time" labels (not True/False or 0/1).
-#   11. persist_mode "overwrite" → "replace" mapping for SQLite.
-#   12. load_new_files_csv() wrapped in try/except against column-mismatch crashes.
-#   13. Feature importance charts added (Section 5).
-#   14. @st.cache_data(ttl=600) on load_data() so it refreshes if CSV is regenerated.
+# Rebuilt for the 50k-row government_files.csv dataset with 22 features.
+# UI overhauled: tabbed navigation, colour-coded KPI cards, trend charts,
+# regional analysis, officer heatmap, and a redesigned prediction panel.
 
 from __future__ import annotations
 
@@ -34,26 +20,102 @@ import streamlit as st
 import uuid
 
 # ---------------------------------------------------------------------------
-# Module-level constants  (single source of truth — fixes DRY violation)
+# Page config — must be first Streamlit call
+# ---------------------------------------------------------------------------
+
+st.set_page_config(
+    page_title="FlowGov AI — Government Workflow Dashboard",
+    page_icon="🏛️",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+# ---------------------------------------------------------------------------
+# Custom CSS
+# ---------------------------------------------------------------------------
+
+st.markdown("""
+<style>
+/* KPI card styling */
+[data-testid="metric-container"] {
+    background: linear-gradient(135deg, #1e293b 0%, #0f172a 100%);
+    border: 1px solid #334155;
+    border-radius: 12px;
+    padding: 1rem 1.2rem;
+    box-shadow: 0 4px 6px -1px rgba(0,0,0,0.3);
+}
+[data-testid="metric-container"] label {
+    color: #94a3b8 !important;
+    font-size: 0.78rem !important;
+    font-weight: 600 !important;
+    letter-spacing: 0.05em !important;
+    text-transform: uppercase !important;
+}
+[data-testid="stMetricValue"] {
+    font-size: 1.8rem !important;
+    font-weight: 700 !important;
+    color: #f1f5f9 !important;
+}
+[data-testid="stMetricDelta"] {
+    font-size: 0.8rem !important;
+}
+
+/* Section headers */
+.section-header {
+    font-size: 1.1rem;
+    font-weight: 700;
+    color: #e2e8f0;
+    border-left: 3px solid #3b82f6;
+    padding-left: 0.6rem;
+    margin-bottom: 0.8rem;
+    margin-top: 0.5rem;
+}
+
+/* Risk badge */
+.risk-high   { color: #ef4444; font-weight: 700; }
+.risk-medium { color: #f59e0b; font-weight: 700; }
+.risk-low    { color: #22c55e; font-weight: 700; }
+
+/* Sidebar */
+[data-testid="stSidebar"] {
+    background: #0f172a;
+}
+
+/* Tab styling */
+[data-testid="stTabs"] button {
+    font-weight: 600;
+}
+
+/* Divider */
+hr { border-color: #1e293b !important; }
+</style>
+""", unsafe_allow_html=True)
+
+# ---------------------------------------------------------------------------
+# Constants
 # ---------------------------------------------------------------------------
 
 FEATURE_DROP_COLS: list[str] = [
-    "file_id",
-    "submission_date",
-    "processing_time_hours",
-    "processing_time_days",
-    "delayed",
-    "delay_ratio",
+    "file_id", "submission_date",
+    "processing_time_hours", "processing_time_days",
+    "delayed", "delay_ratio",
+]
+
+BOOL_COLS: list[str] = [
+    "online_submission", "incomplete_docs", "resubmission", "escalated",
 ]
 
 NUMERIC_CAST_COLS: list[str] = [
-    "complexity_score",
-    "num_pages",
-    "required_approvals",
-    "officer_experience_years",
-    "current_backlog_officer",
-    "sla_days",
+    "complexity_score", "num_pages", "required_approvals",
+    "officer_experience_years", "current_backlog_officer",
+    "sla_days", "submission_month", "submission_weekday",
+    "online_submission", "incomplete_docs", "resubmission", "escalated",
 ]
+
+DATA_FILE = "government_files.csv"
+
+CHART_COLORS = px.colors.qualitative.Set2
+DELAY_COLOR  = {"Delayed": "#ef4444", "On-time": "#22c55e"}
 
 # ---------------------------------------------------------------------------
 # Resource / data loaders
@@ -61,58 +123,48 @@ NUMERIC_CAST_COLS: list[str] = [
 
 @st.cache_resource
 def load_models():
-    """
-    Load both model artifacts.  Each artifact is now a dict:
-        {model, feature_cols, trained_at, n_train_rows}
-    Returns (reg_pipeline, cls_pipeline, feature_cols, reg_meta, cls_meta).
-    """
     models_dir = Path(__file__).resolve().parents[1] / "models"
     reg_path   = models_dir / "processing_time_model.pkl"
     cls_path   = models_dir / "delay_risk_model.pkl"
 
     for p in (reg_path, cls_path):
         if not p.exists():
-            st.error(f"Model file not found: `{p}`.  Run `train_models.py` first.")
+            st.error(f"Model file not found: `{p}`. Run `train_models.py` first.")
             st.stop()
 
     reg_art = joblib.load(reg_path)
     cls_art = joblib.load(cls_path)
 
-    # Support both old (bare Pipeline) and new (dict) artifact formats
-    if isinstance(reg_art, dict):
-        reg_pipeline  = reg_art["model"]
-        feature_cols  = reg_art["feature_cols"]
-        reg_meta      = {k: v for k, v in reg_art.items() if k != "model"}
-    else:
-        reg_pipeline  = reg_art
-        feature_cols  = None
-        reg_meta      = {}
+    reg_pipeline = reg_art["model"]        if isinstance(reg_art, dict) else reg_art
+    xgb_model    = reg_art.get("xgb_model") if isinstance(reg_art, dict) else None
+    feature_cols = reg_art.get("feature_cols") if isinstance(reg_art, dict) else None
+    reg_meta     = {k: v for k, v in reg_art.items() if k not in ("model","xgb_model")} \
+                   if isinstance(reg_art, dict) else {}
 
-    cls_pipeline = cls_art["model"] if isinstance(cls_art, dict) else cls_art
-    cls_meta     = {k: v for k, v in cls_art.items() if k != "model"} if isinstance(cls_art, dict) else {}
+    cls_pipeline = cls_art["model"]        if isinstance(cls_art, dict) else cls_art
+    cls_meta     = {k: v for k, v in cls_art.items() if k != "model"} \
+                   if isinstance(cls_art, dict) else {}
 
-    return reg_pipeline, cls_pipeline, feature_cols, reg_meta, cls_meta
+    return reg_pipeline, xgb_model, cls_pipeline, feature_cols, reg_meta, cls_meta
 
 
-@st.cache_data(ttl=600)  # re-read from disk at most every 10 min
+@st.cache_data(ttl=600)
 def load_data() -> pd.DataFrame:
-    data_path = Path(__file__).resolve().parents[2] / "data" / "synthetic_files.csv"
+    data_path = Path(__file__).resolve().parents[2] / "data" / DATA_FILE
     if not data_path.exists():
-        st.error(f"Dataset not found: `{data_path}`.  Run `data_gen.py` first.")
+        st.error(f"Dataset not found: `{data_path}`. Run `data_gen.py` first.")
         st.stop()
-    return pd.read_csv(data_path, parse_dates=["submission_date"])
+    df = pd.read_csv(data_path, parse_dates=["submission_date"])
+    for col in BOOL_COLS:
+        if col in df.columns:
+            df[col] = df[col].astype(int)
+    return df
 
 
 @st.cache_data
 def load_feature_importance(name: str) -> pd.DataFrame:
-    """
-    Load feature_importance_<name>.csv from src/models/.
-    Returns an empty DataFrame and shows a warning if the file is absent.
-    """
     fi_path = Path(__file__).resolve().parents[1] / "models" / f"feature_importance_{name}.csv"
-    if not fi_path.exists():
-        return pd.DataFrame()
-    return pd.read_csv(fi_path)
+    return pd.read_csv(fi_path) if fi_path.exists() else pd.DataFrame()
 
 
 # ---------------------------------------------------------------------------
@@ -120,14 +172,13 @@ def load_feature_importance(name: str) -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 
 def ensure_data_folder() -> Path:
-    data_dir = Path(__file__).resolve().parents[2] / "data"
-    data_dir.mkdir(parents=True, exist_ok=True)
-    return data_dir
+    d = Path(__file__).resolve().parents[2] / "data"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
 
 
-def save_predictions_csv(df_preds: pd.DataFrame, filename: str = "predictions.csv", mode: str = "append") -> str:
-    data_dir = ensure_data_folder()
-    path = data_dir / filename
+def save_predictions_csv(df_preds: pd.DataFrame, mode: str = "append") -> str:
+    path = ensure_data_folder() / "predictions.csv"
     if mode == "overwrite" or not path.exists():
         df_preds.to_csv(path, index=False)
     else:
@@ -135,46 +186,16 @@ def save_predictions_csv(df_preds: pd.DataFrame, filename: str = "predictions.cs
     return str(path)
 
 
-def get_predictions_csv(filename: str = "predictions.csv") -> pd.DataFrame:
-    path = ensure_data_folder() / filename
-    return pd.read_csv(path) if path.exists() else pd.DataFrame()
-
-
-def save_predictions_sqlite(
-    df_preds: pd.DataFrame,
-    dbname: str = "predictions.db",
-    table: str = "predictions",
-    if_exists: str = "append",
-) -> str:
-    """
-    Persist predictions to SQLite.
-    if_exists: 'append' or 'replace'  (pandas does NOT accept 'overwrite').
-    The caller is responsible for mapping 'overwrite' -> 'replace' before calling.
-    """
-    db_path = ensure_data_folder() / dbname
+def save_predictions_sqlite(df_preds: pd.DataFrame, if_exists: str = "append") -> str:
+    db_path = ensure_data_folder() / "predictions.db"
     conn: Connection = sqlite3.connect(str(db_path))
-    df_preds.to_sql(table, conn, if_exists=if_exists, index=False)
+    df_preds.to_sql("predictions", conn, if_exists=if_exists, index=False)
     conn.close()
     return str(db_path)
 
 
-def get_predictions_sqlite(dbname: str = "predictions.db", table: str = "predictions") -> pd.DataFrame:
-    db_path = ensure_data_folder() / dbname
-    if not db_path.exists():
-        return pd.DataFrame()
-    conn = sqlite3.connect(str(db_path))
-    try:
-        df = pd.read_sql_query(f"SELECT * FROM {table}", conn)
-    except Exception:
-        df = pd.DataFrame()
-    finally:
-        conn.close()
-    return df
-
-
-def save_new_file_csv(row_dict: dict, filename: str = "new_files.csv", mode: str = "append") -> str:
-    data_dir = ensure_data_folder()
-    path = data_dir / filename
+def save_new_file_csv(row_dict: dict, mode: str = "append") -> str:
+    path = ensure_data_folder() / "new_files.csv"
     df_row = pd.DataFrame([row_dict])
     if mode == "overwrite" or not path.exists():
         df_row.to_csv(path, index=False)
@@ -183,152 +204,88 @@ def save_new_file_csv(row_dict: dict, filename: str = "new_files.csv", mode: str
     return str(path)
 
 
-def load_new_files_csv(filename: str = "new_files.csv") -> pd.DataFrame:
-    path = ensure_data_folder() / filename
+def load_new_files_csv() -> pd.DataFrame:
+    path = ensure_data_folder() / "new_files.csv"
     if not path.exists():
         return pd.DataFrame()
     try:
-        df = pd.read_csv(path, parse_dates=["submission_date"])
+        return pd.read_csv(path, parse_dates=["submission_date"])
     except Exception:
-        # Fallback: load without parse_dates if column is absent / malformed
-        df = pd.read_csv(path)
-    return df
-
-
-# ---------------------------------------------------------------------------
-# KPI helper
-# ---------------------------------------------------------------------------
-
-def top_kpi(df: pd.DataFrame):
-    """Return (total, avg_hours, delayed_count, avg_delay_ratio).
-    Returns zeros when df is empty to avoid int(NaN) ValueError."""
-    if df.empty:
-        return 0, 0.0, 0, 0.0
-
-    total           = len(df)
-    avg_hours       = round(float(df["processing_time_hours"].mean()), 2)
-    # Cast to int only after ensuring the series is numeric and non-null
-    delayed_series  = pd.to_numeric(df["delayed"], errors="coerce").fillna(0)
-    delayed_count   = int(delayed_series.sum())
-    avg_delay_ratio = round(float(df["delay_ratio"].mean()), 3)
-    return total, avg_hours, delayed_count, avg_delay_ratio
-
-
-def extract_first_stage(routing_str) -> str:
-    try:
-        return str(routing_str).split("->")[0]
-    except Exception:
-        return "Unknown"
+        return pd.read_csv(path)
 
 
 # ---------------------------------------------------------------------------
 # Prediction helpers
 # ---------------------------------------------------------------------------
 
-def _fill_feature_defaults(X: pd.DataFrame, sample_df: pd.DataFrame, feature_cols: list[str]) -> pd.DataFrame:
-    """
-    Ensure every column in feature_cols exists in X.
-    Missing columns are filled with sensible defaults derived from sample_df.
-    This is the single source of truth — replaces the duplicated if/elif chains.
-    """
-    col_defaults = {
-        "department":              sample_df["department"].mode().iloc[0],
-        "file_type":               sample_df["file_type"].mode().iloc[0],
-        "priority":                "Low",
-        "complexity_score":        0.2,
-        "num_pages":               3,
-        "required_approvals":      1,
-        "assigned_officer_id":     "OFF001",
-        "officer_experience_years": 2.0,
-        "current_backlog_officer": 3,
-        "routing_path":            "Clerk->Officer",
-        "sla_days":                7,
-    }
+_COL_DEFAULTS = {
+    "department": "Revenue", "file_type": "application", "priority": "Low",
+    "region": "Central", "complexity_score": 0.2, "num_pages": 5,
+    "required_approvals": 1, "assigned_officer_id": "OFF001",
+    "officer_experience_years": 2.0, "current_backlog_officer": 5,
+    "online_submission": 1, "incomplete_docs": 0,
+    "resubmission": 0, "escalated": 0,
+    "routing_path": "Clerk->Officer", "sla_days": 7,
+    "submission_month": 6, "submission_weekday": 1,
+}
+
+
+def _prepare_X(row: "dict | pd.Series", feature_cols: list[str]) -> pd.DataFrame:
+    X = pd.DataFrame([row if isinstance(row, dict) else row.to_dict()])
     for c in feature_cols:
         if c not in X.columns:
-            X[c] = col_defaults.get(c, 0)
-    return X
-
-
-def prepare_row_for_prediction(
-    row: "dict | pd.Series",
-    feature_cols: list[str],
-    sample_df: pd.DataFrame,
-) -> pd.DataFrame:
-    """Convert a single row (Series or dict) to a feature-aligned DataFrame."""
-    if isinstance(row, pd.Series):
-        X = row.to_frame().T.reset_index(drop=True)
-    else:
-        X = pd.DataFrame([row])
-
-    X = _fill_feature_defaults(X, sample_df, feature_cols)
+            X[c] = _COL_DEFAULTS.get(c, 0)
     X = X[feature_cols].copy()
-
     for nc in NUMERIC_CAST_COLS:
         if nc in X.columns:
             X[nc] = pd.to_numeric(X[nc], errors="coerce").fillna(0)
-
     return X
 
 
-def predict_for_row(
-    reg,
-    cls,
+def predict_single(
+    reg, xgb_model, cls,
     row: "dict | pd.Series",
     feature_cols: list[str],
-    sample_df: pd.DataFrame,
 ) -> Tuple[float, float]:
-    """
-    Predict processing hours and delay probability for a single input.
-    Returns (pred_hours, pred_delay_prob).
-    """
-    X = prepare_row_for_prediction(row, feature_cols, sample_df)
-
-    pred_hours = float(reg.predict(X)[0])
-
-    pred_prob = 0.0
+    X = _prepare_X(row, feature_cols)
+    lgbm_pred = float(reg.predict(X)[0])
+    if xgb_model is not None:
+        xgb_pred = float(xgb_model.predict(X)[0])
+        pred_hours = (lgbm_pred + xgb_pred) / 2.0
+    else:
+        pred_hours = lgbm_pred
     try:
-        proba     = cls.predict_proba(X)
-        pred_prob = float(proba[0][1])   # column 1 = 'Delayed'
+        pred_prob = float(cls.predict_proba(X)[0][1])
     except Exception:
-        try:
-            pred_prob = float(cls.predict(X)[0])
-        except Exception:
-            pred_prob = 0.0
-
+        pred_prob = float(cls.predict(X)[0])
     return pred_hours, pred_prob
 
 
 def predict_batch(
-    reg,
-    cls,
+    reg, xgb_model, cls,
     df_subset: pd.DataFrame,
     feature_cols: list[str],
-    sample_df: pd.DataFrame,
     max_rows: int | None = None,
 ) -> pd.DataFrame:
-    """
-    Vectorised batch prediction — builds the feature matrix once, then calls
-    each model once.  Optionally limits to max_rows rows.
-    """
-    df_proc = (
-        df_subset.head(max_rows).copy().reset_index(drop=True)
-        if max_rows is not None
-        else df_subset.copy().reset_index(drop=True)
-    )
-
+    df_proc = (df_subset.head(max_rows) if max_rows else df_subset).copy().reset_index(drop=True)
     X = pd.DataFrame(index=df_proc.index)
     for c in feature_cols:
         X[c] = df_proc[c] if c in df_proc.columns else np.nan
-
-    X = _fill_feature_defaults(X, sample_df, feature_cols)
+    for c in feature_cols:
+        if c not in X.columns:
+            X[c] = _COL_DEFAULTS.get(c, 0)
     X = X[feature_cols].copy()
-
     for nc in NUMERIC_CAST_COLS:
         if nc in X.columns:
             X[nc] = pd.to_numeric(X[nc], errors="coerce").fillna(0)
 
-    pred_hours = reg.predict(X)
+    lgbm_preds = reg.predict(X)
+    if xgb_model is not None:
+        xgb_preds = xgb_model.predict(X)
+        pred_hours = (lgbm_preds + xgb_preds) / 2.0
+    else:
+        pred_hours = lgbm_preds
+
     try:
         pred_probs = cls.predict_proba(X)[:, 1]
     except Exception:
@@ -340,416 +297,736 @@ def predict_batch(
     return out
 
 
+# ---------------------------------------------------------------------------
+# KPI helper
+# ---------------------------------------------------------------------------
+
+def compute_kpis(df: pd.DataFrame):
+    if df.empty:
+        return 0, 0.0, 0, 0.0, 0.0
+    total        = len(df)
+    avg_hours    = round(float(df["processing_time_hours"].mean()), 1)
+    delayed      = int(pd.to_numeric(df["delayed"], errors="coerce").fillna(0).sum())
+    delay_pct    = round(delayed / total * 100, 1)
+    avg_ratio    = round(float(df["delay_ratio"].mean()), 3)
+    return total, avg_hours, delayed, delay_pct, avg_ratio
+
+
+def extract_first_stage(routing_str) -> str:
+    try:
+        return str(routing_str).split("->")[0]
+    except Exception:
+        return "Unknown"
+
+
 # ===========================================================================
-# App UI
+# LOAD RESOURCES
 # ===========================================================================
 
-st.set_page_config(page_title="Gov File Workflow Dashboard", layout="wide")
-st.title("AI Workflow Optimization — Dashboard")
-
-# --- Load resources ---
 df = load_data()
-reg_model, cls_model, feature_cols_from_model, reg_meta, cls_meta = load_models()
+reg_model, xgb_model, cls_model, feature_cols_from_model, reg_meta, cls_meta = load_models()
+FEATURE_COLS: list[str] = feature_cols_from_model or [
+    c for c in df.columns if c not in FEATURE_DROP_COLS
+]
 
-# If models were saved in new dict format, use embedded feature_cols.
-# Otherwise fall back to deriving them from the CSV (old pkl compatibility).
-if feature_cols_from_model is not None:
-    FEATURE_COLS: list[str] = feature_cols_from_model
-else:
-    FEATURE_COLS = [c for c in df.columns if c not in FEATURE_DROP_COLS]
+# ===========================================================================
+# SIDEBAR
+# ===========================================================================
 
-# Show model metadata if available
-if reg_meta.get("trained_at"):
-    st.caption(
-        f"Models trained at **{reg_meta['trained_at']}** "
-        f"on {reg_meta.get('n_train_rows', '?'):,} training rows."
-    )
+with st.sidebar:
+    st.image("https://img.icons8.com/fluency/48/government.png", width=42)
+    st.markdown("## FlowGov AI")
+    st.markdown("*Government Workflow Intelligence*")
+    st.divider()
+
+    st.markdown("### Filters")
+    departments = ["All"] + sorted(df["department"].dropna().unique().tolist())
+    regions     = ["All"] + sorted(df["region"].dropna().unique().tolist()) \
+                  if "region" in df.columns else ["All"]
+    file_types  = ["All"] + sorted(df["file_type"].dropna().unique().tolist())
+    priorities  = ["All"] + sorted(df["priority"].dropna().unique().tolist())
+
+    sel_dept      = st.selectbox("Department",  departments)
+    sel_region    = st.selectbox("Region",       regions) if "region" in df.columns else "All"
+    sel_file_type = st.selectbox("File Type",    file_types)
+    sel_priority  = st.selectbox("Priority",     priorities)
+
+    date_min = df["submission_date"].min().date()
+    date_max = df["submission_date"].max().date()
+    sel_dates = st.date_input("Date range", [date_min, date_max])
+    search_officer = st.text_input("Search Officer ID", "")
+
+    st.divider()
+
+    # Model metadata
+    if reg_meta.get("trained_at"):
+        st.markdown("### Model Info")
+        st.caption(f"Trained: `{reg_meta['trained_at']}`")
+        st.caption(f"Training rows: `{reg_meta.get('n_train_rows', '?'):,}`")
+        m = reg_meta.get("metrics", {})
+        if m:
+            st.caption(f"Reg R²: `{m.get('r2', '?'):.3f}`")
+        m2 = cls_meta.get("metrics", {})
+        if m2:
+            st.caption(f"Cls AUC: `{m2.get('roc_auc', '?'):.3f}`")
+
 
 # ---------------------------------------------------------------------------
-# Sidebar filters
+# Apply filters
 # ---------------------------------------------------------------------------
 
-st.sidebar.header("Filters")
-
-departments = ["All"] + sorted(df["department"].dropna().unique().tolist())
-file_types  = ["All"] + sorted(df["file_type"].dropna().unique().tolist())
-priorities  = ["All"] + sorted(df["priority"].dropna().unique().tolist())
-
-sel_dept      = st.sidebar.selectbox("Department", departments)
-sel_file_type = st.sidebar.selectbox("File Type",  file_types)
-sel_priority  = st.sidebar.selectbox("Priority",   priorities)
-
-date_min = df["submission_date"].min()
-date_max = df["submission_date"].max()
-sel_date_range = st.sidebar.date_input("Submission date range", [date_min.date(), date_max.date()])
-
-search_officer = st.sidebar.text_input("Search Officer ID (partial)", "")
-
-# Build mask — use df.index so alignment is always correct (fixes RT-04)
 mask = pd.Series(True, index=df.index)
-
 if sel_dept != "All":
     mask &= df["department"] == sel_dept
+if "region" in df.columns and sel_region != "All":
+    mask &= df["region"] == sel_region
 if sel_file_type != "All":
     mask &= df["file_type"] == sel_file_type
 if sel_priority != "All":
     mask &= df["priority"] == sel_priority
-if sel_date_range and len(sel_date_range) == 2:
-    start_dt = pd.to_datetime(sel_date_range[0])
-    end_dt   = pd.to_datetime(sel_date_range[1]) + pd.Timedelta(days=1) - pd.Timedelta(seconds=1)
-    mask &= (df["submission_date"] >= start_dt) & (df["submission_date"] <= end_dt)
+if isinstance(sel_dates, (list, tuple)) and len(sel_dates) == 2:
+    s = pd.to_datetime(sel_dates[0])
+    e = pd.to_datetime(sel_dates[1]) + pd.Timedelta(days=1) - pd.Timedelta(seconds=1)
+    mask &= (df["submission_date"] >= s) & (df["submission_date"] <= e)
 if search_officer.strip():
     mask &= df["assigned_officer_id"].str.contains(search_officer.strip(), case=False, na=False)
 
 df_f = df[mask].copy()
 
-# ---------------------------------------------------------------------------
-# Top KPIs
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# HEADER & KPIs
+# ===========================================================================
 
-total, avg_hours, delayed_count, avg_delay_ratio = top_kpi(df_f)  # safe on empty df
-col1, col2, col3, col4 = st.columns([1.2, 1, 1, 1])
-col1.metric("Total files",          f"{total:,}")
-col2.metric("Avg processing (hrs)", f"{avg_hours}")
-col3.metric("Delayed files",        f"{delayed_count}")
-col4.metric("Avg delay ratio",      f"{avg_delay_ratio}")
+st.markdown('<h1 style="font-size:1.8rem;font-weight:800;color:#f1f5f9;">🏛️ FlowGov AI — Workflow Dashboard</h1>', unsafe_allow_html=True)
 
-st.markdown("---")
+total, avg_hours, delayed, delay_pct, avg_ratio = compute_kpis(df_f)
 
-# ---------------------------------------------------------------------------
-# Main charts — guarded against empty filter
-# ---------------------------------------------------------------------------
+c1, c2, c3, c4, c5 = st.columns(5)
+c1.metric("Total Files",       f"{total:,}")
+c2.metric("Avg Processing",    f"{avg_hours:.0f} hrs",  f"{avg_hours/24:.1f} days")
+c3.metric("Delayed Files",     f"{delayed:,}",          f"{delay_pct:.1f}% of total")
+c4.metric("Avg SLA Usage",     f"{avg_ratio*100:.1f}%")
+c5.metric("On-Time Rate",      f"{100-delay_pct:.1f}%")
 
-if df_f.empty:
-    st.warning("⚠️ No files match the current filters. Adjust the sidebar options.")
-else:
-    left, right = st.columns([2.5, 1])
+# ===========================================================================
+# MAIN TABS
+# ===========================================================================
 
-    with left:
-        st.subheader("Processing time distribution")
-        fig_hist = px.histogram(
-            df_f, x="processing_time_hours", nbins=60,
-            title="Distribution of processing time (hours)", marginal="box",
-        )
-        st.plotly_chart(fig_hist, use_container_width=True)
+tab_overview, tab_analytics, tab_predict, tab_features, tab_newfile = st.tabs([
+    "📊 Overview",
+    "🔍 Analytics",
+    "🤖 Predictions",
+    "📈 Feature Insights",
+    "➕ Add New File",
+])
 
-        st.subheader("Avg processing time by Department / File Type")
-        agg = (
-            df_f.groupby(["department", "file_type"])["processing_time_hours"]
-            .mean()
+# ===========================================================================
+# TAB 1: OVERVIEW
+# ===========================================================================
+
+with tab_overview:
+    if df_f.empty:
+        st.warning("No files match the current filters.")
+    else:
+        col_left, col_right = st.columns([3, 1])
+
+        with col_left:
+            # --- Processing time distribution ---
+            st.markdown('<p class="section-header">Processing Time Distribution</p>', unsafe_allow_html=True)
+            fig_hist = px.histogram(
+                df_f, x="processing_time_hours", nbins=50,
+                marginal="box",
+                color_discrete_sequence=["#3b82f6"],
+                labels={"processing_time_hours": "Processing Hours"},
+            )
+            fig_hist.update_layout(
+                plot_bgcolor="#0f172a", paper_bgcolor="#0f172a",
+                font_color="#94a3b8", showlegend=False,
+                margin=dict(l=10, r=10, t=20, b=10), height=320,
+            )
+            fig_hist.update_xaxes(gridcolor="#1e293b")
+            fig_hist.update_yaxes(gridcolor="#1e293b")
+            st.plotly_chart(fig_hist, use_container_width=True)
+
+            # --- Avg processing by dept & file type ---
+            st.markdown('<p class="section-header">Avg Processing Time by Department & File Type</p>', unsafe_allow_html=True)
+            agg = (
+                df_f.groupby(["department", "file_type"])["processing_time_hours"]
+                .mean().reset_index()
+            )
+            fig_bar = px.bar(
+                agg, x="department", y="processing_time_hours",
+                color="file_type", barmode="group",
+                color_discrete_sequence=CHART_COLORS,
+                labels={"processing_time_hours": "Avg Hours", "department": "Department"},
+            )
+            fig_bar.update_layout(
+                plot_bgcolor="#0f172a", paper_bgcolor="#0f172a",
+                font_color="#94a3b8", legend_title_text="File Type",
+                margin=dict(l=10, r=10, t=20, b=10), height=320,
+            )
+            fig_bar.update_xaxes(gridcolor="#1e293b")
+            fig_bar.update_yaxes(gridcolor="#1e293b")
+            st.plotly_chart(fig_bar, use_container_width=True)
+
+        with col_right:
+            # --- Delay pie ---
+            st.markdown('<p class="section-header">Delay Status</p>', unsafe_allow_html=True)
+            label_map = {True: "Delayed", False: "On-time", 1: "Delayed", 0: "On-time"}
+            dl = df_f["delayed"].map(label_map).fillna("Unknown").value_counts().reset_index()
+            dl.columns = ["Status", "Count"]
+            fig_pie = px.pie(
+                dl, names="Status", values="Count",
+                color="Status", color_discrete_map=DELAY_COLOR,
+                hole=0.5,
+            )
+            fig_pie.update_layout(
+                plot_bgcolor="#0f172a", paper_bgcolor="#0f172a",
+                font_color="#94a3b8", showlegend=True,
+                margin=dict(l=10, r=10, t=10, b=10), height=260,
+                legend=dict(orientation="h", yanchor="bottom", y=-0.2),
+            )
+            st.plotly_chart(fig_pie, use_container_width=True)
+
+            # --- Quick stats ---
+            st.markdown('<p class="section-header">Quick Stats</p>', unsafe_allow_html=True)
+            stats = {
+                "Median pages": f"{int(df_f['num_pages'].median())}",
+                "Avg approvals": f"{df_f['required_approvals'].mean():.1f}",
+                "Avg experience": f"{df_f['officer_experience_years'].mean():.1f} yrs",
+                "Avg backlog": f"{df_f['current_backlog_officer'].mean():.0f} files",
+            }
+            if "online_submission" in df_f.columns:
+                stats["Online submissions"] = f"{df_f['online_submission'].mean()*100:.0f}%"
+            if "incomplete_docs" in df_f.columns:
+                stats["Incomplete docs"] = f"{df_f['incomplete_docs'].mean()*100:.0f}%"
+            for k, v in stats.items():
+                st.markdown(f"**{k}:** {v}")
+
+        # --- Submission trend over time ---
+        st.markdown('<p class="section-header">Monthly Filing Volume & Delay Rate</p>', unsafe_allow_html=True)
+        trend = (
+            df_f.assign(month=df_f["submission_date"].dt.to_period("M").astype(str))
+            .groupby("month")
+            .agg(
+                total=("file_id", "count"),
+                delayed_count=("delayed", "sum"),
+            )
             .reset_index()
         )
-        fig_bar = px.bar(
-            agg, x="department", y="processing_time_hours", color="file_type",
-            barmode="group", title="Avg processing time (hrs)",
-        )
-        st.plotly_chart(fig_bar, use_container_width=True)
+        trend["delay_rate"] = trend["delayed_count"] / trend["total"] * 100
 
-        st.subheader("Bottleneck: Avg processing time by First Routing Stage")
-        df_f["first_stage"] = df_f["routing_path"].apply(extract_first_stage)
+        fig_trend = go.Figure()
+        fig_trend.add_trace(go.Bar(
+            x=trend["month"], y=trend["total"],
+            name="Total Files", marker_color="#3b82f6", opacity=0.7,
+        ))
+        fig_trend.add_trace(go.Scatter(
+            x=trend["month"], y=trend["delay_rate"],
+            name="Delay Rate %", yaxis="y2",
+            line=dict(color="#ef4444", width=2),
+            mode="lines+markers",
+        ))
+        fig_trend.update_layout(
+            yaxis2=dict(overlaying="y", side="right", title="Delay Rate %", range=[0, 80]),
+            plot_bgcolor="#0f172a", paper_bgcolor="#0f172a",
+            font_color="#94a3b8", height=300,
+            margin=dict(l=10, r=10, t=20, b=10),
+            legend=dict(orientation="h", yanchor="bottom", y=1.02),
+        )
+        fig_trend.update_xaxes(gridcolor="#1e293b")
+        fig_trend.update_yaxes(gridcolor="#1e293b")
+        st.plotly_chart(fig_trend, use_container_width=True)
+
+
+# ===========================================================================
+# TAB 2: ANALYTICS
+# ===========================================================================
+
+with tab_analytics:
+    if df_f.empty:
+        st.warning("No files match the current filters.")
+    else:
+        col_a, col_b = st.columns(2)
+
+        # --- Regional analysis ---
+        if "region" in df_f.columns:
+            with col_a:
+                st.markdown('<p class="section-header">Delay Rate by Region</p>', unsafe_allow_html=True)
+                reg_agg = (
+                    df_f.groupby("region")
+                    .agg(total=("file_id","count"), delayed=("delayed","sum"))
+                    .reset_index()
+                )
+                reg_agg["delay_rate"] = reg_agg["delayed"] / reg_agg["total"] * 100
+                fig_reg = px.bar(
+                    reg_agg.sort_values("delay_rate", ascending=True),
+                    x="delay_rate", y="region", orientation="h",
+                    color="delay_rate",
+                    color_continuous_scale="RdYlGn_r",
+                    labels={"delay_rate": "Delay Rate %", "region": "Region"},
+                )
+                fig_reg.update_layout(
+                    plot_bgcolor="#0f172a", paper_bgcolor="#0f172a",
+                    font_color="#94a3b8", coloraxis_showscale=False,
+                    height=280, margin=dict(l=10, r=10, t=20, b=10),
+                )
+                st.plotly_chart(fig_reg, use_container_width=True)
+
+        # --- Priority breakdown ---
+        with col_b:
+            st.markdown('<p class="section-header">Processing Time by Priority</p>', unsafe_allow_html=True)
+            fig_box = px.box(
+                df_f, x="priority", y="processing_time_hours",
+                color="priority",
+                color_discrete_map={"High": "#ef4444", "Medium": "#f59e0b", "Low": "#22c55e"},
+                category_orders={"priority": ["High", "Medium", "Low"]},
+                labels={"processing_time_hours": "Hours", "priority": "Priority"},
+            )
+            fig_box.update_layout(
+                plot_bgcolor="#0f172a", paper_bgcolor="#0f172a",
+                font_color="#94a3b8", showlegend=False,
+                height=280, margin=dict(l=10, r=10, t=20, b=10),
+            )
+            st.plotly_chart(fig_box, use_container_width=True)
+
+        # --- Officer performance heatmap ---
+        st.markdown('<p class="section-header">Top 20 Officers — Delay Rate Heatmap</p>', unsafe_allow_html=True)
+        officer_agg = (
+            df_f.groupby("assigned_officer_id")
+            .agg(
+                total=("file_id","count"),
+                delayed_count=("delayed","sum"),
+                avg_hours=("processing_time_hours","mean"),
+                avg_exp=("officer_experience_years","mean"),
+            )
+            .reset_index()
+        )
+        officer_agg["delay_rate"] = officer_agg["delayed_count"] / officer_agg["total"] * 100
+        top_officers = officer_agg.nlargest(20, "total")
+
+        fig_off = px.scatter(
+            top_officers,
+            x="avg_exp", y="delay_rate",
+            size="total", color="avg_hours",
+            hover_name="assigned_officer_id",
+            hover_data={"total": True, "delayed_count": True},
+            color_continuous_scale="RdYlGn_r",
+            labels={
+                "avg_exp": "Avg Experience (yrs)",
+                "delay_rate": "Delay Rate %",
+                "avg_hours": "Avg Processing Hrs",
+                "total": "Files Handled",
+            },
+        )
+        fig_off.update_layout(
+            plot_bgcolor="#0f172a", paper_bgcolor="#0f172a",
+            font_color="#94a3b8", height=350,
+            margin=dict(l=10, r=10, t=20, b=10),
+        )
+        st.plotly_chart(fig_off, use_container_width=True)
+
+        # --- Correlation heatmap ---
+        st.markdown('<p class="section-header">Feature Correlation Matrix</p>', unsafe_allow_html=True)
+        num_cols_heatmap = [
+            c for c in [
+                "complexity_score", "num_pages", "required_approvals",
+                "officer_experience_years", "current_backlog_officer",
+                "online_submission", "incomplete_docs", "resubmission",
+                "escalated", "sla_days", "processing_time_hours", "delay_ratio",
+            ] if c in df_f.columns
+        ]
+        corr = df_f[num_cols_heatmap].corr()
+        fig_heat = go.Figure(data=go.Heatmap(
+            z=corr.values, x=corr.columns, y=corr.index,
+            colorscale="RdBu", zmid=0,
+            text=corr.round(2).values,
+            texttemplate="%{text}",
+            textfont={"size": 9},
+        ))
+        fig_heat.update_layout(
+            plot_bgcolor="#0f172a", paper_bgcolor="#0f172a",
+            font_color="#94a3b8", height=460,
+            margin=dict(l=10, r=10, t=20, b=10),
+        )
+        st.plotly_chart(fig_heat, use_container_width=True)
+
+        # --- Bottleneck: first routing stage ---
+        st.markdown('<p class="section-header">Bottleneck: Avg Processing by First Routing Stage</p>', unsafe_allow_html=True)
+        df_f_copy = df_f.copy()
+        df_f_copy["first_stage"] = df_f_copy["routing_path"].apply(extract_first_stage)
         stage_agg = (
-            df_f.groupby("first_stage")["processing_time_hours"]
-            .mean()
+            df_f_copy.groupby("first_stage")["processing_time_hours"]
+            .agg(["mean", "count"])
             .reset_index()
-            .sort_values("processing_time_hours", ascending=False)
+            .rename(columns={"mean": "avg_hours", "count": "total_files"})
+            .sort_values("avg_hours", ascending=False)
         )
-        fig_stage = px.bar(stage_agg, x="first_stage", y="processing_time_hours",
-                           title="Avg hrs by first stage")
+        fig_stage = px.bar(
+            stage_agg, x="first_stage", y="avg_hours",
+            color="avg_hours", color_continuous_scale="Reds",
+            text="total_files",
+            labels={"first_stage": "First Stage", "avg_hours": "Avg Hours"},
+        )
+        fig_stage.update_traces(texttemplate="%{text} files", textposition="outside")
+        fig_stage.update_layout(
+            plot_bgcolor="#0f172a", paper_bgcolor="#0f172a",
+            font_color="#94a3b8", coloraxis_showscale=False,
+            height=320, margin=dict(l=10, r=10, t=30, b=10),
+        )
         st.plotly_chart(fig_stage, use_container_width=True)
 
-    with right:
-        st.subheader("Delay risk overview")
-        # Fix ST-02: map bool/int → human-readable label before charting
-        label_map = {True: "Delayed", False: "On-time", 1: "Delayed", 0: "On-time"}
-        delay_labels = df_f["delayed"].map(label_map).fillna("Unknown")
-        delay_counts = delay_labels.value_counts().reset_index()
-        delay_counts.columns = ["Status", "Count"]
-        fig_pie = px.pie(delay_counts, names="Status", values="Count",
-                         title="Delayed vs On-time",
-                         color_discrete_map={"Delayed": "#EF4444", "On-time": "#22C55E"})
-        st.plotly_chart(fig_pie, use_container_width=True)
 
-        st.subheader("Quick stats")
-        st.write("Median pages:",            int(df_f["num_pages"].median()))
-        st.write("Avg required approvals:",  round(df_f["required_approvals"].mean(), 2))
-        st.write("Avg officer exp (yrs):",   round(df_f["officer_experience_years"].mean(), 2))
-        st.write("Avg backlog per officer:", round(df_f["current_backlog_officer"].mean(), 2))
+# ===========================================================================
+# TAB 3: PREDICTIONS
+# ===========================================================================
 
-    st.markdown("---")
-
-    # Correlation heatmap
-    st.subheader("Numeric feature correlations (heatmap)")
-    numeric_col_names = [
-        "complexity_score", "num_pages", "required_approvals",
-        "officer_experience_years", "current_backlog_officer",
-        "processing_time_hours", "delay_ratio",
-    ]
-    corr = df_f[numeric_col_names].corr()
-    fig_heat = go.Figure(data=go.Heatmap(
-        z=corr.values, x=corr.columns, y=corr.index, colorscale="Viridis",
-    ))
-    fig_heat.update_layout(height=400, margin=dict(l=40, r=40, t=40, b=40))
-    st.plotly_chart(fig_heat, use_container_width=True)
-
-st.markdown("---")
-
-# ---------------------------------------------------------------------------
-# Section: Single-file prediction
-# ---------------------------------------------------------------------------
-
-st.subheader("Predict processing time & delay risk for a file")
-
-if df_f.empty:
-    st.info("Apply filters that return at least one file to enable single-file prediction.")
-else:
-    file_options = df_f["file_id"].tolist()
-    selected = st.selectbox("Pick a file (filtered view)", options=file_options)
-
-    if selected:
-        row = df.loc[df["file_id"] == selected].iloc[0]
-        st.write("**File details (selected):**")
-        st.write({
-            "file_id":          row["file_id"],
-            "department":       row["department"],
-            "file_type":        row["file_type"],
-            "priority":         row["priority"],
-            "num_pages":        int(row["num_pages"]),
-            "complexity_score": float(row["complexity_score"]),
-            "required_approvals": int(row["required_approvals"]),
-        })
-
-        if st.button("Predict for selected file"):
-            pred_hours, prob = predict_for_row(reg_model, cls_model, row, FEATURE_COLS, df)
-            st.success(f"Predicted processing time: **{pred_hours:.2f} hours** ({pred_hours/24:.2f} days)")
-            st.info(f"Predicted delay probability: **{prob*100:.1f}%**")
-
-st.markdown("---")
-
-# ---------------------------------------------------------------------------
-# Section: Batch predictions (with session_state persistence — fix ST-04)
-# ---------------------------------------------------------------------------
-
-st.subheader("Files (sample) — with optional predictions and persistence")
-
-col_a, col_b, col_c = st.columns([1, 1, 1])
-with col_a:
-    do_predict = st.button("Compute predictions for filtered files")
-with col_b:
-    fast_mode  = st.checkbox("Fast mode (limit rows)", value=True)
-    limit_rows = st.number_input("Max rows in fast mode", min_value=100, max_value=5000, value=500, step=100)
-with col_c:
-    persist_now    = st.checkbox("Persist after compute", value=False)
-    persist_target = st.selectbox("Persist target", ["CSV (data/predictions.csv)", "SQLite (data/predictions.db)"])
-    persist_mode   = st.selectbox("Persist mode", ["append", "overwrite"])
-
-display_cols = [
-    "file_id", "department", "file_type", "priority", "submission_date",
-    "processing_time_hours", "delayed", "assigned_officer_id", "current_backlog_officer",
-]
-
-# --- Compute and store in session_state so widgets survive re-runs ---
-if do_predict:
+with tab_predict:
     if df_f.empty:
-        st.warning("No rows to predict — adjust the filters first.")
+        st.info("Adjust filters to load files for prediction.")
     else:
-        with st.spinner("Computing predictions for filtered files…"):
-            max_r = int(limit_rows) if fast_mode else None
-            preds_df = predict_batch(reg_model, cls_model, df_f, FEATURE_COLS, df, max_rows=max_r)
-        st.session_state["preds_df"] = preds_df
+        pred_col1, pred_col2 = st.columns([1, 1])
 
-# --- Render batch results if they exist in session ---
-if "preds_df" in st.session_state:
-    preds_df  = st.session_state["preds_df"]
-    show_cols = [c for c in display_cols if c in preds_df.columns] + ["pred_processing_hours", "pred_delay_prob"]
+        # --- Single-file prediction ---
+        with pred_col1:
+            st.markdown('<p class="section-header">Single-File Prediction</p>', unsafe_allow_html=True)
+            file_options = df_f["file_id"].tolist()
+            selected = st.selectbox("Select a file", options=file_options[:500])
 
-    st.dataframe(
-        preds_df[show_cols].sort_values("submission_date", ascending=False).head(500),
-        use_container_width=True,
-    )
+            if selected:
+                row = df.loc[df["file_id"] == selected].iloc[0]
 
-    csv_bytes = preds_df.to_csv(index=False).encode("utf-8")
-    st.download_button(
-        "⬇ Download filtered results with predictions (CSV)",
-        data=csv_bytes,
-        file_name="filtered_with_predictions.csv",
-        mime="text/csv",
-    )
+                with st.expander("File details", expanded=True):
+                    detail_cols = [
+                        "department", "file_type", "priority", "complexity_score",
+                        "num_pages", "required_approvals", "sla_days",
+                    ]
+                    detail_cols += [c for c in ["region", "online_submission", "incomplete_docs", "resubmission", "escalated"] if c in row.index]
+                    st.json({k: (bool(v) if k in BOOL_COLS else v)
+                             for k, v in row[detail_cols].to_dict().items()})
 
-    if persist_now:
-        if persist_target.startswith("CSV"):
-            save_path = save_predictions_csv(preds_df, filename="predictions.csv", mode=persist_mode)
-            st.success(f"Saved predictions to CSV: `{save_path}`")
+                if st.button("Run Prediction", type="primary"):
+                    ph, prob = predict_single(reg_model, xgb_model, cls_model, row, FEATURE_COLS)
+                    sla_h = float(row.get("sla_days", 7)) * 24
+                    ratio = ph / sla_h
+
+                    # Risk level
+                    risk_label = "HIGH" if prob > 0.6 else ("MEDIUM" if prob > 0.35 else "LOW")
+                    risk_class = "risk-high" if prob > 0.6 else ("risk-medium" if prob > 0.35 else "risk-low")
+
+                    st.success(f"Predicted processing time: **{ph:.1f} hrs** ({ph/24:.1f} days)")
+
+                    gauge = go.Figure(go.Indicator(
+                        mode="gauge+number+delta",
+                        value=prob * 100,
+                        title={"text": "Delay Risk %", "font": {"color": "#f1f5f9"}},
+                        delta={"reference": 34, "valueformat": ".1f"},
+                        gauge={
+                            "axis": {"range": [0, 100], "tickcolor": "#94a3b8"},
+                            "bar": {"color": "#ef4444" if prob > 0.6 else "#f59e0b" if prob > 0.35 else "#22c55e"},
+                            "bgcolor": "#1e293b",
+                            "steps": [
+                                {"range": [0, 35],  "color": "#052e16"},
+                                {"range": [35, 60], "color": "#451a03"},
+                                {"range": [60, 100],"color": "#450a0a"},
+                            ],
+                            "threshold": {
+                                "line": {"color": "white", "width": 3},
+                                "thickness": 0.85,
+                                "value": prob * 100,
+                            },
+                        },
+                        number={"suffix": "%", "font": {"color": "#f1f5f9"}},
+                    ))
+                    gauge.update_layout(
+                        paper_bgcolor="#0f172a", font_color="#94a3b8",
+                        height=280, margin=dict(l=20, r=20, t=40, b=20),
+                    )
+                    st.plotly_chart(gauge, use_container_width=True)
+
+                    st.markdown(f"""
+                    | Metric | Value |
+                    |--------|-------|
+                    | SLA hours | {sla_h:.0f} h |
+                    | Predicted hours | {ph:.1f} h |
+                    | SLA utilisation | {ratio*100:.1f}% |
+                    | Risk level | <span class="{risk_class}">{risk_label}</span> |
+                    """, unsafe_allow_html=True)
+
+                    if prob > 0.6:
+                        st.warning("**Recommendation:** Escalate to senior officer or reassign to reduce backlog impact.")
+                    elif prob > 0.35:
+                        st.info("**Recommendation:** Monitor closely — check documentation completeness.")
+
+        # --- Batch predictions ---
+        with pred_col2:
+            st.markdown('<p class="section-header">Batch Predictions</p>', unsafe_allow_html=True)
+
+            b1, b2 = st.columns(2)
+            with b1:
+                fast_mode  = st.checkbox("Fast mode (limit rows)", value=True)
+                limit_rows = st.number_input("Max rows", 100, 5000, 500, 100) if fast_mode else None
+            with b2:
+                persist_now    = st.checkbox("Persist results", value=False)
+                persist_target = st.selectbox("Target", ["CSV", "SQLite"])
+                persist_mode   = st.selectbox("Mode",   ["append", "overwrite"])
+
+            if st.button("Compute Batch Predictions", type="primary"):
+                with st.spinner("Running predictions..."):
+                    preds_df = predict_batch(
+                        reg_model, xgb_model, cls_model, df_f,
+                        FEATURE_COLS, max_rows=int(limit_rows) if fast_mode else None,
+                    )
+                st.session_state["preds_df"] = preds_df
+
+            if "preds_df" in st.session_state:
+                preds_df = st.session_state["preds_df"]
+                show_cols = [c for c in [
+                    "file_id","department","file_type","priority","submission_date",
+                    "processing_time_hours","delayed","assigned_officer_id",
+                ] if c in preds_df.columns] + ["pred_processing_hours","pred_delay_prob"]
+
+                st.dataframe(
+                    preds_df[show_cols].sort_values("submission_date", ascending=False).head(300),
+                    use_container_width=True, height=320,
+                )
+
+                # Download
+                st.download_button(
+                    "Download predictions (CSV)",
+                    data=preds_df.to_csv(index=False).encode("utf-8"),
+                    file_name="predictions_export.csv",
+                    mime="text/csv",
+                )
+
+                if persist_now:
+                    sql_mode = "replace" if persist_mode == "overwrite" else "append"
+                    if persist_target == "CSV":
+                        path = save_predictions_csv(preds_df, mode=persist_mode)
+                    else:
+                        path = save_predictions_sqlite(preds_df, if_exists=sql_mode)
+                    st.success(f"Saved to: `{path}`")
+
+                # Prediction summary chart
+                fig_pred_hist = px.histogram(
+                    preds_df, x="pred_delay_prob", nbins=30,
+                    color_discrete_sequence=["#ef4444"],
+                    labels={"pred_delay_prob": "Predicted Delay Probability"},
+                )
+                fig_pred_hist.update_layout(
+                    plot_bgcolor="#0f172a", paper_bgcolor="#0f172a",
+                    font_color="#94a3b8", height=220,
+                    margin=dict(l=10, r=10, t=20, b=10),
+                )
+                st.plotly_chart(fig_pred_hist, use_container_width=True)
+
+
+# ===========================================================================
+# TAB 4: FEATURE INSIGHTS
+# ===========================================================================
+
+with tab_features:
+    fi_col1, fi_col2 = st.columns(2)
+
+    with fi_col1:
+        st.markdown('<p class="section-header">Processing Time — Feature Importance</p>', unsafe_allow_html=True)
+        fi_reg = load_feature_importance("reg")
+        if fi_reg.empty:
+            st.warning("Run `train_models.py` to generate feature importance files.")
         else:
-            # Fix RT-03: map "overwrite" → "replace" for pandas to_sql
-            sql_mode  = "replace" if persist_mode == "overwrite" else "append"
-            save_path = save_predictions_sqlite(preds_df, dbname="predictions.db",
-                                                table="predictions", if_exists=sql_mode)
-            st.success(f"Saved predictions to SQLite: `{save_path}`")
-        st.info("Data saved under `data/`.  Avoid committing large files to git.")
+            fig_fi_reg = px.bar(
+                fi_reg.head(15).sort_values("importance_mean"),
+                x="importance_mean", y="feature",
+                error_x="importance_std",
+                orientation="h",
+                color="importance_mean",
+                color_continuous_scale="Blues",
+                labels={"importance_mean": "Permutation Importance", "feature": "Feature"},
+            )
+            fig_fi_reg.update_layout(
+                plot_bgcolor="#0f172a", paper_bgcolor="#0f172a",
+                font_color="#94a3b8", coloraxis_showscale=False,
+                height=420, margin=dict(l=10, r=10, t=20, b=10),
+            )
+            st.plotly_chart(fig_fi_reg, use_container_width=True)
+            with st.expander("Full importance table"):
+                st.dataframe(fi_reg, use_container_width=True)
 
-    # Persisted store preview
-    st.markdown("**Persisted store preview**")
-    if persist_target.startswith("CSV"):
-        persisted = get_predictions_csv("predictions.csv")
-    else:
-        persisted = get_predictions_sqlite("predictions.db", "predictions")
+    with fi_col2:
+        st.markdown('<p class="section-header">Delay Risk — Feature Importance</p>', unsafe_allow_html=True)
+        fi_cls = load_feature_importance("cls")
+        if fi_cls.empty:
+            st.warning("Run `train_models.py` to generate feature importance files.")
+        else:
+            fig_fi_cls = px.bar(
+                fi_cls.head(15).sort_values("importance_mean"),
+                x="importance_mean", y="feature",
+                error_x="importance_std",
+                orientation="h",
+                color="importance_mean",
+                color_continuous_scale="Reds",
+                labels={"importance_mean": "Permutation Importance", "feature": "Feature"},
+            )
+            fig_fi_cls.update_layout(
+                plot_bgcolor="#0f172a", paper_bgcolor="#0f172a",
+                font_color="#94a3b8", coloraxis_showscale=False,
+                height=420, margin=dict(l=10, r=10, t=20, b=10),
+            )
+            st.plotly_chart(fig_fi_cls, use_container_width=True)
+            with st.expander("Full importance table"):
+                st.dataframe(fi_cls, use_container_width=True)
 
-    if not persisted.empty:
-        st.write(f"Persisted rows: {len(persisted):,}")
-        st.dataframe(persisted.head(200), use_container_width=True)
-        st.download_button(
-            "⬇ Download persisted store (CSV)",
-            data=persisted.to_csv(index=False).encode("utf-8"),
-            file_name="persisted_predictions.csv",
-            mime="text/csv",
-        )
-    else:
-        st.write("No persisted predictions found yet.")
+    # --- Model performance summary ---
+    st.markdown('<p class="section-header">Model Performance Summary</p>', unsafe_allow_html=True)
+    mc1, mc2 = st.columns(2)
+    with mc1:
+        rm = reg_meta.get("metrics", {})
+        if rm:
+            st.markdown("**Regression (Processing Time)**")
+            st.metric("R² Score",  f"{rm.get('r2',0):.4f}")
+            st.metric("RMSE",      f"{rm.get('rmse',0):.1f} hrs")
+            st.metric("CV R² (5-fold)", f"{rm.get('r2_mean',0):.4f} ± {rm.get('r2_std',0):.4f}")
+    with mc2:
+        cm = cls_meta.get("metrics", {})
+        if cm:
+            st.markdown("**Classification (Delay Risk)**")
+            st.metric("ROC-AUC",   f"{cm.get('roc_auc',0):.4f}")
+            st.metric("F1-Score",  f"{cm.get('f1',0):.4f}")
+            st.metric("CV AUC (5-fold)", f"{cm.get('roc_auc_mean',0):.4f} ± {cm.get('roc_auc_std',0):.4f}")
 
-else:
-    # No predictions computed yet — show raw sample
-    if not df_f.empty:
-        safe_display = [c for c in display_cols if c in df_f.columns]
-        st.dataframe(
-            df_f[safe_display].sort_values("submission_date", ascending=False).head(200),
-            use_container_width=True,
-        )
 
-# ---------------------------------------------------------------------------
-# Section: Feature importance charts  (fix ST-03 — was entirely missing)
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# TAB 5: ADD NEW FILE
+# ===========================================================================
 
-st.markdown("---")
-st.subheader("📊 Feature Importance (Permutation — Validation Set)")
+with tab_newfile:
+    nf_col1, nf_col2 = st.columns([1, 1])
 
-fi_tab_reg, fi_tab_cls = st.tabs(["Regression (processing time)", "Classification (delay risk)"])
+    with nf_col1:
+        st.markdown('<p class="section-header">Submit New File for Prediction</p>', unsafe_allow_html=True)
 
-with fi_tab_reg:
-    fi_reg = load_feature_importance("reg")
-    if fi_reg.empty:
-        st.warning(
-            "Feature importance file not found (`feature_importance_reg.csv`).  "
-            "Re-run `train_models.py` to generate it."
-        )
-    else:
-        fig_fi_reg = px.bar(
-            fi_reg.head(15).sort_values("importance_mean"),
-            x="importance_mean",
-            y="feature",
-            error_x="importance_std",
-            orientation="h",
-            title="Top 15 features — Processing Time (Regression)",
-            labels={"importance_mean": "Mean Permutation Importance", "feature": "Feature"},
-            color="importance_mean",
-            color_continuous_scale="Blues",
-        )
-        fig_fi_reg.update_layout(showlegend=False, coloraxis_showscale=False)
-        st.plotly_chart(fig_fi_reg, use_container_width=True)
-        with st.expander("Show full importance table"):
-            st.dataframe(fi_reg, use_container_width=True)
+        with st.form("add_file_form"):
+            f1, f2 = st.columns(2)
+            with f1:
+                new_dept     = st.selectbox("Department",   sorted(df["department"].unique()))
+                new_ftype    = st.selectbox("File Type",    ["application","permit","appeal","report"])
+                new_priority = st.selectbox("Priority",     ["Low","Medium","High"])
+                new_region   = st.selectbox("Region",       ["North","South","East","West","Central"]) \
+                               if "region" in df.columns else "Central"
+            with f2:
+                new_pages     = st.number_input("Num pages",        value=5,   min_value=1, max_value=300)
+                new_complex   = st.slider("Complexity (0-1)",        0.0, 1.0, 0.2, 0.01)
+                new_approvals = st.number_input("Required approvals", value=2, min_value=1, max_value=6)
+                new_officer   = st.text_input("Officer ID",          "OFF001")
 
-with fi_tab_cls:
-    fi_cls = load_feature_importance("cls")
-    if fi_cls.empty:
-        st.warning(
-            "Feature importance file not found (`feature_importance_cls.csv`).  "
-            "Re-run `train_models.py` to generate it."
-        )
-    else:
-        fig_fi_cls = px.bar(
-            fi_cls.head(15).sort_values("importance_mean"),
-            x="importance_mean",
-            y="feature",
-            error_x="importance_std",
-            orientation="h",
-            title="Top 15 features — Delay Risk (Classification)",
-            labels={"importance_mean": "Mean Permutation Importance", "feature": "Feature"},
-            color="importance_mean",
-            color_continuous_scale="Reds",
-        )
-        fig_fi_cls.update_layout(showlegend=False, coloraxis_showscale=False)
-        st.plotly_chart(fig_fi_cls, use_container_width=True)
-        with st.expander("Show full importance table"):
-            st.dataframe(fi_cls, use_container_width=True)
+            f3, f4 = st.columns(2)
+            with f3:
+                new_exp      = st.number_input("Officer experience (yrs)", value=2.0, step=0.5)
+                new_backlog  = st.number_input("Officer backlog",          value=5,   min_value=0)
+            with f4:
+                new_online   = st.checkbox("Online submission",   value=True)
+                new_incdocs  = st.checkbox("Incomplete docs",     value=False)
+                new_resub    = st.checkbox("Resubmission",        value=False)
+                new_escalate = st.checkbox("Escalated",           value=False)
 
-# ---------------------------------------------------------------------------
-# Sidebar: Add new file form
-# ---------------------------------------------------------------------------
+            persist_new = st.checkbox("Save to new_files.csv", value=True)
+            submitted   = st.form_submit_button("Predict & Submit", type="primary")
 
-st.sidebar.markdown("---")
-st.sidebar.subheader("Add new file (manual & predict)")
+    with nf_col2:
+        if submitted:
+            month   = datetime.now().month
+            weekday = datetime.now().weekday()
+            sla_map = {
+                "application": {"Low": 7,  "Medium": 5,  "High": 3},
+                "permit":      {"Low": 14, "Medium": 10, "High": 5},
+                "appeal":      {"Low": 21, "Medium": 14, "High": 7},
+                "report":      {"Low": 10, "Medium": 7,  "High": 4},
+            }
+            sla_d = sla_map[new_ftype][new_priority]
+            stages = ["Clerk","Officer","SectionHead","Finance","Director"]
+            routing = "->".join(stages[: min(len(stages), 1 + new_approvals)])
 
-with st.sidebar.form("add_file"):
-    new_ftype      = st.selectbox("File type",    ["application", "permit", "appeal", "report"])
-    new_dept       = st.selectbox("Department",   sorted(df["department"].unique()))
-    new_priority   = st.selectbox("Priority",     ["Low", "Medium", "High"])
-    new_pages      = st.number_input("Num pages", value=5,   min_value=1)
-    new_complex    = st.slider("Complexity (0–1)", 0.0, 1.0, 0.2, 0.01)
-    new_approvals  = st.number_input("Required approvals", value=1, min_value=1, max_value=10)
-    new_officer    = st.text_input("Assigned officer ID", value="OFF001", max_chars=10)
-    new_experience = st.number_input("Officer experience (yrs)", value=2.0, min_value=0.0, step=0.1)
-    new_backlog    = st.number_input("Officer backlog",          value=5,   min_value=0)
+            new_row = {
+                "file_id":                  str(uuid.uuid4()),
+                "department":               new_dept,
+                "file_type":                new_ftype,
+                "priority":                 new_priority,
+                "region":                   new_region,
+                "submission_date":          datetime.now(),
+                "submission_month":         month,
+                "submission_weekday":       weekday,
+                "complexity_score":         float(new_complex),
+                "num_pages":                int(new_pages),
+                "required_approvals":       int(new_approvals),
+                "assigned_officer_id":      new_officer.strip(),
+                "officer_experience_years": float(new_exp),
+                "current_backlog_officer":  int(new_backlog),
+                "online_submission":        int(new_online),
+                "incomplete_docs":          int(new_incdocs),
+                "resubmission":             int(new_resub),
+                "escalated":                int(new_escalate),
+                "routing_path":             routing,
+                "sla_days":                 sla_d,
+                "processing_time_hours":    None,
+                "delayed":                  None,
+                "delay_ratio":              None,
+                "processing_time_days":     None,
+            }
 
-    persist_new_file = st.checkbox("Persist new file to CSV (data/new_files.csv)", value=True)
-    new_file_mode    = st.selectbox("New file save mode", ["append", "overwrite"])
+            ph, prob = predict_single(reg_model, xgb_model, cls_model, new_row, FEATURE_COLS)
+            new_row["pred_processing_hours"] = round(ph, 2)
+            new_row["pred_delay_prob"]       = round(prob, 3)
 
-    submit = st.form_submit_button("Add (predict & save)")
+            risk = "HIGH" if prob > 0.6 else ("MEDIUM" if prob > 0.35 else "LOW")
+            risk_color = "#ef4444" if prob > 0.6 else "#f59e0b" if prob > 0.35 else "#22c55e"
 
-if submit:
-    new_file_id     = str(uuid.uuid4())
-    submission_date = datetime.now()
+            st.markdown(f"""
+            ### Prediction Result
 
-    new_row = {
-        "file_id":                  new_file_id,
-        "department":               new_dept,
-        "file_type":                new_ftype,
-        "priority":                 new_priority,
-        "submission_date":          submission_date,
-        "complexity_score":         float(new_complex),
-        "num_pages":                int(new_pages),
-        "required_approvals":       int(new_approvals),
-        "assigned_officer_id":      new_officer.strip(),
-        "officer_experience_years": float(new_experience),
-        "current_backlog_officer":  int(new_backlog),
-        "routing_path":             "Clerk->Officer",
-        "sla_days":                 7,
-        # targets are unknown for new files
-        "processing_time_hours":    None,
-        "delayed":                  None,
-        "delay_ratio":              None,
-        "processing_time_days":     None,
-    }
+            | | |
+            |---|---|
+            | **Predicted Processing Time** | {ph:.1f} hrs ({ph/24:.1f} days) |
+            | **Delay Probability** | {prob*100:.1f}% |
+            | **Risk Level** | <span style="color:{risk_color};font-weight:bold">{risk}</span> |
+            | **SLA** | {sla_d} days ({sla_d*24} hrs) |
+            | **SLA Usage** | {ph/(sla_d*24)*100:.1f}% |
+            """, unsafe_allow_html=True)
 
-    pred_hours, prob = predict_for_row(reg_model, cls_model, new_row, FEATURE_COLS, df)
-    new_row["pred_processing_hours"] = round(pred_hours, 2)
-    new_row["pred_delay_prob"]       = round(prob, 3)
+            gauge2 = go.Figure(go.Indicator(
+                mode="gauge+number",
+                value=prob * 100,
+                title={"text": "Delay Risk", "font": {"color": "#f1f5f9"}},
+                gauge={
+                    "axis": {"range": [0, 100], "tickcolor": "#94a3b8"},
+                    "bar": {"color": risk_color},
+                    "bgcolor": "#1e293b",
+                    "steps": [
+                        {"range": [0, 35],  "color": "#052e16"},
+                        {"range": [35, 60], "color": "#451a03"},
+                        {"range": [60, 100],"color": "#450a0a"},
+                    ],
+                },
+                number={"suffix": "%", "font": {"color": "#f1f5f9"}},
+            ))
+            gauge2.update_layout(
+                paper_bgcolor="#0f172a", font_color="#94a3b8",
+                height=250, margin=dict(l=20, r=20, t=40, b=20),
+            )
+            st.plotly_chart(gauge2, use_container_width=True)
 
-    st.sidebar.success(f"Predicted time: **{pred_hours:.2f} hrs** ({pred_hours/24:.2f} days)")
-    st.sidebar.info(f"Delay probability: **{prob*100:.1f}%**")
+            if persist_new:
+                path = save_new_file_csv(new_row)
+                st.success(f"Saved: `{path}`")
 
-    if persist_new_file:
-        save_path = save_new_file_csv(new_row, filename="new_files.csv", mode=new_file_mode)
-        st.sidebar.success(f"Saved to: `{save_path}`")
-
-# ---------------------------------------------------------------------------
-# Section: Recently added new files
-# ---------------------------------------------------------------------------
-
-st.markdown("---")
-st.subheader("Recently Added New Files (from form)")
-
-new_files_df = load_new_files_csv("new_files.csv")
-if not new_files_df.empty:
-    st.write(f"Total new files persisted: **{len(new_files_df)}**")
-    sort_col = "submission_date" if "submission_date" in new_files_df.columns else new_files_df.columns[0]
-    st.dataframe(
-        new_files_df.sort_values(by=sort_col, ascending=False).head(50),
-        use_container_width=True,
-    )
-else:
-    st.write("No new files have been added yet.")
-
-st.markdown(
-    "**Note:** Predictions are local. To productionise, add a FastAPI endpoint "
-    "or a scheduled batch job, and avoid committing large CSV/DB files to git."
-)
+        # --- Recently added files ---
+        st.markdown('<p class="section-header">Recently Added Files</p>', unsafe_allow_html=True)
+        new_files_df = load_new_files_csv()
+        if not new_files_df.empty:
+            st.write(f"Total: **{len(new_files_df)}** files")
+            sort_col = "submission_date" if "submission_date" in new_files_df.columns else new_files_df.columns[0]
+            st.dataframe(
+                new_files_df.sort_values(sort_col, ascending=False).head(20),
+                use_container_width=True, height=280,
+            )
+        else:
+            st.info("No new files submitted yet.")
