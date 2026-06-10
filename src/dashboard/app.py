@@ -133,6 +133,27 @@ def dark_layout(height=320, **extra) -> dict:
     layout.update(extra)
     return layout
 
+
+def add_interaction_features(X: pd.DataFrame) -> pd.DataFrame:
+    """Mirror of train_models.add_interaction_features — must stay in sync."""
+    X = X.copy()
+    inc  = X["incomplete_docs"].astype(float)
+    resub = X["resubmission"].astype(float)
+    esc  = X["escalated"].astype(float)
+    onl  = X["online_submission"].astype(float)
+    appr = X["required_approvals"].astype(float)
+    comp = X["complexity_score"].astype(float)
+    back = X["current_backlog_officer"].astype(float)
+    X["flag_sum"]                  = inc + resub + esc
+    X["incomplete_x_approvals"]    = inc  * appr
+    X["resubmission_x_incomplete"] = resub * inc
+    X["escalated_x_backlog"]       = esc  * back
+    X["complexity_x_backlog"]      = comp * back
+    X["complexity_x_approvals"]    = comp * appr
+    X["online_x_incomplete"]       = onl  * inc
+    return X
+
+
 # ---------------------------------------------------------------------------
 # Resource / data loaders
 # ---------------------------------------------------------------------------
@@ -248,13 +269,14 @@ _COL_DEFAULTS = {
 
 def _prepare_X(row: "dict | pd.Series", feature_cols: list[str]) -> pd.DataFrame:
     X = pd.DataFrame([row if isinstance(row, dict) else row.to_dict()])
+    for nc in NUMERIC_CAST_COLS:
+        if nc in X.columns:
+            X[nc] = pd.to_numeric(X[nc], errors="coerce").fillna(0)
+    X = add_interaction_features(X)
     for c in feature_cols:
         if c not in X.columns:
             X[c] = _COL_DEFAULTS.get(c, 0)
     X = X[feature_cols].copy()
-    for nc in NUMERIC_CAST_COLS:
-        if nc in X.columns:
-            X[nc] = pd.to_numeric(X[nc], errors="coerce").fillna(0)
     return X
 
 
@@ -284,16 +306,14 @@ def predict_batch(
     max_rows: int | None = None,
 ) -> pd.DataFrame:
     df_proc = (df_subset.head(max_rows) if max_rows else df_subset).copy().reset_index(drop=True)
+    for nc in NUMERIC_CAST_COLS:
+        if nc in df_proc.columns:
+            df_proc[nc] = pd.to_numeric(df_proc[nc], errors="coerce").fillna(0)
+    df_proc = add_interaction_features(df_proc)
     X = pd.DataFrame(index=df_proc.index)
     for c in feature_cols:
-        X[c] = df_proc[c] if c in df_proc.columns else np.nan
-    for c in feature_cols:
-        if c not in X.columns:
-            X[c] = _COL_DEFAULTS.get(c, 0)
+        X[c] = df_proc[c] if c in df_proc.columns else _COL_DEFAULTS.get(c, 0)
     X = X[feature_cols].copy()
-    for nc in NUMERIC_CAST_COLS:
-        if nc in X.columns:
-            X[nc] = pd.to_numeric(X[nc], errors="coerce").fillna(0)
 
     lgbm_preds = reg.predict(X)
     if xgb_model is not None:
@@ -1042,6 +1062,8 @@ with tab_features:
             st.metric("ROC-AUC",   f"{cm.get('roc_auc',0):.4f}")
             st.metric("F1-Score",  f"{cm.get('f1',0):.4f}")
             st.metric("CV AUC (5-fold)", f"{cm.get('roc_auc_mean',0):.4f} ± {cm.get('roc_auc_std',0):.4f}")
+            if "opt_threshold" in cm:
+                st.metric("Optimal Threshold", f"{cm['opt_threshold']:.2f}")
 
 
 # ===========================================================================

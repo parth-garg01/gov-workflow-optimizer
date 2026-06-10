@@ -90,18 +90,54 @@ def load_dataset() -> pd.DataFrame:
 # Feature engineering
 # ---------------------------------------------------------------------------
 
+def add_interaction_features(X: pd.DataFrame) -> pd.DataFrame:
+    """
+    Add 7 interaction features identified by EDA.
+
+    EDA findings that motivated each feature:
+      - incomplete_docs x required_approvals: delay rate 19% -> 82% across bins
+      - resubmission x incomplete_docs:        delay rate 23% -> 78% combined
+      - flag_sum (0-3 risk score):             delay rate 21% -> 91% at flag_sum=3
+      - escalated x current_backlog:           high-backlog escalated files worst
+      - complexity x required_approvals:       both drive processing time
+      - complexity x current_backlog:          overloaded officers struggle on complex files
+      - online_submission x incomplete_docs:   online but incomplete = still fast to flag
+    """
+    X = X.copy()
+    inc  = X["incomplete_docs"].astype(float)
+    resub = X["resubmission"].astype(float)
+    esc  = X["escalated"].astype(float)
+    onl  = X["online_submission"].astype(float)
+    appr = X["required_approvals"].astype(float)
+    comp = X["complexity_score"].astype(float)
+    back = X["current_backlog_officer"].astype(float)
+
+    X["flag_sum"]                  = inc + resub + esc           # 0-3 overall risk score
+    X["incomplete_x_approvals"]    = inc  * appr                 # key EDA finding
+    X["resubmission_x_incomplete"] = resub * inc                 # 78% delay when both=1
+    X["escalated_x_backlog"]       = esc  * back                 # backlog amplifies escalation
+    X["complexity_x_backlog"]      = comp * back                 # overloaded on complex files
+    X["complexity_x_approvals"]    = comp * appr                 # complexity drives approval time
+    X["online_x_incomplete"]       = onl  * inc                  # online but docs missing
+
+    return X
+
+
 def build_feature_sets(df: pd.DataFrame):
     """
     Returns X, y_reg, y_cls, categorical_cols, numeric_cols, feature_cols.
-    Boolean columns are cast to int so they're treated as numeric features.
+    Boolean columns are cast to int; interaction features are added from EDA.
     """
     feature_cols = [c for c in df.columns if c not in FEATURE_DROP_COLS]
 
     X = df[feature_cols].copy()
-    # Cast bool flags to int (0/1) — pipelines handle them as numeric
+    # Cast bool flags to int (0/1)
     for col in BOOL_COLS:
         if col in X.columns:
             X[col] = X[col].astype(int)
+
+    # Add EDA-driven interaction features
+    X = add_interaction_features(X)
 
     y_reg = df["processing_time_hours"].copy()
     y_cls = df["delayed"].astype(int).copy()
@@ -109,6 +145,7 @@ def build_feature_sets(df: pd.DataFrame):
     categorical_cols = X.select_dtypes(include=["object"]).columns.tolist()
     numeric_cols     = X.select_dtypes(exclude=["object"]).columns.tolist()
 
+    feature_cols = X.columns.tolist()   # updated to include interaction features
     print(f"\nFeatures: {len(feature_cols)}  "
           f"(cat={len(categorical_cols)}, num={len(numeric_cols)})")
     print("  Categorical:", categorical_cols)
@@ -200,6 +237,18 @@ def train_regression_model(
     return lgbm_pipe, xgb_pipe, {"rmse": rmse_ens, "r2": r2_ens}
 
 
+def find_optimal_threshold(proba: np.ndarray, y_true: np.ndarray) -> float:
+    """Sweep thresholds 0.20-0.70 and return the one that maximises F1."""
+    best_t, best_f1 = 0.5, 0.0
+    for t in np.arange(0.20, 0.71, 0.01):
+        preds = (proba >= t).astype(int)
+        f = f1_score(y_true, preds)
+        if f > best_f1:
+            best_f1, best_t = f, float(round(t, 2))
+    print(f"Optimal threshold: {best_t:.2f}  (F1={best_f1:.4f})")
+    return best_t
+
+
 def train_classification_model(
     categorical_cols, numeric_cols,
     X_train, y_train, X_val, y_val,
@@ -228,8 +277,9 @@ def train_classification_model(
     print("\nTraining LightGBM classifier…")
     cls_pipe.fit(X_train, y_train)
 
-    preds      = cls_pipe.predict(X_val)
     proba      = cls_pipe.predict_proba(X_val)[:, 1]
+    opt_t      = find_optimal_threshold(proba, y_val)
+    preds      = (proba >= opt_t).astype(int)
     acc        = accuracy_score(y_val, preds)
     roc_auc    = roc_auc_score(y_val, proba)
     f1         = f1_score(y_val, preds)
@@ -237,11 +287,11 @@ def train_classification_model(
     print(f"\n=== Classification (delayed) ===")
     print(f"Accuracy  : {acc:.4f}")
     print(f"ROC-AUC   : {roc_auc:.4f}")
-    print(f"F1-Score  : {f1:.4f}")
+    print(f"F1-Score  : {f1:.4f}  (threshold={opt_t:.2f})")
     print("\nClassification report:")
     print(classification_report(y_val, preds, target_names=["On time", "Delayed"]))
 
-    return cls_pipe, {"accuracy": acc, "roc_auc": roc_auc, "f1": f1}
+    return cls_pipe, {"accuracy": acc, "roc_auc": roc_auc, "f1": f1, "opt_threshold": opt_t}
 
 
 # ---------------------------------------------------------------------------
