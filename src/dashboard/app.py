@@ -652,6 +652,63 @@ with tab_analytics:
         )
         st.plotly_chart(fig_heat, use_container_width=True)
 
+        # --- Seasonality charts ---
+        seas_col1, seas_col2 = st.columns(2)
+        if "submission_month" in df_f.columns:
+            with seas_col1:
+                st.markdown('<p class="section-header">Monthly Delay Rate (Seasonality)</p>', unsafe_allow_html=True)
+                month_names = {1:"Jan",2:"Feb",3:"Mar",4:"Apr",5:"May",6:"Jun",
+                               7:"Jul",8:"Aug",9:"Sep",10:"Oct",11:"Nov",12:"Dec"}
+                mo_agg = (
+                    df_f.groupby("submission_month")
+                    .agg(total=("file_id","count"), delayed=("delayed","sum"))
+                    .reset_index()
+                )
+                mo_agg["delay_rate"] = mo_agg["delayed"] / mo_agg["total"] * 100
+                mo_agg["month_name"] = mo_agg["submission_month"].map(month_names)
+                fig_mo = px.bar(
+                    mo_agg, x="month_name", y="delay_rate",
+                    color="delay_rate", color_continuous_scale="RdYlGn_r",
+                    labels={"delay_rate":"Delay Rate %","month_name":"Month"},
+                    text=mo_agg["delay_rate"].round(1),
+                )
+                fig_mo.update_traces(texttemplate="%{text}%", textposition="outside")
+                fig_mo.update_layout(
+                    plot_bgcolor="#0f172a", paper_bgcolor="#0f172a",
+                    font_color="#94a3b8", coloraxis_showscale=False,
+                    height=280, margin=dict(l=10,r=10,t=30,b=10),
+                    xaxis=dict(categoryorder="array",
+                               categoryarray=list(month_names.values())),
+                )
+                st.plotly_chart(fig_mo, use_container_width=True)
+
+        if "submission_weekday" in df_f.columns:
+            with seas_col2:
+                st.markdown('<p class="section-header">Weekday Delay Rate</p>', unsafe_allow_html=True)
+                day_names = {0:"Mon",1:"Tue",2:"Wed",3:"Thu",4:"Fri",5:"Sat",6:"Sun"}
+                wd_agg = (
+                    df_f.groupby("submission_weekday")
+                    .agg(total=("file_id","count"), delayed=("delayed","sum"))
+                    .reset_index()
+                )
+                wd_agg["delay_rate"] = wd_agg["delayed"] / wd_agg["total"] * 100
+                wd_agg["day_name"]   = wd_agg["submission_weekday"].map(day_names)
+                fig_wd = px.bar(
+                    wd_agg, x="day_name", y="delay_rate",
+                    color="delay_rate", color_continuous_scale="RdYlGn_r",
+                    labels={"delay_rate":"Delay Rate %","day_name":"Weekday"},
+                    text=wd_agg["delay_rate"].round(1),
+                )
+                fig_wd.update_traces(texttemplate="%{text}%", textposition="outside")
+                fig_wd.update_layout(
+                    plot_bgcolor="#0f172a", paper_bgcolor="#0f172a",
+                    font_color="#94a3b8", coloraxis_showscale=False,
+                    height=280, margin=dict(l=10,r=10,t=30,b=10),
+                    xaxis=dict(categoryorder="array",
+                               categoryarray=list(day_names.values())),
+                )
+                st.plotly_chart(fig_wd, use_container_width=True)
+
         # --- Bottleneck: first routing stage ---
         st.markdown('<p class="section-header">Bottleneck: Avg Processing by First Routing Stage</p>', unsafe_allow_html=True)
         df_f_copy = df_f.copy()
