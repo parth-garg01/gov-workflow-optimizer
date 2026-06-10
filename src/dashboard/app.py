@@ -1048,7 +1048,7 @@ with tab_features:
 # TAB 5: ADD NEW FILE
 # ===========================================================================
 
-with tab_newfile:
+with tab_newfile:  # noqa: E303 — tab block
     nf_col1, nf_col2 = st.columns([1, 1])
 
     with nf_col1:
@@ -1179,3 +1179,27 @@ with tab_newfile:
             )
         else:
             st.info("No new files submitted yet.")
+
+# ===========================================================================
+# FOOTER
+# ===========================================================================
+
+st.divider()
+trained_info = reg_meta.get("trained_at", "unknown")
+dataset_info = reg_meta.get("dataset", "government_files.csv")
+n_train      = reg_meta.get("n_train_rows", 0)
+r2_val       = reg_meta.get("metrics", {}).get("r2", 0)
+auc_val      = cls_meta.get("metrics", {}).get("roc_auc", 0)
+
+st.markdown(
+    f"""
+    <div style="text-align:center;color:#475569;font-size:0.75rem;padding:0.5rem 0;">
+    <strong>FlowGov AI</strong> &nbsp;|&nbsp;
+    Dataset: <code>{dataset_info}</code> ({n_train:,} training rows) &nbsp;|&nbsp;
+    Trained: <code>{trained_info}</code> &nbsp;|&nbsp;
+    Reg R²: <code>{r2_val:.3f}</code> &nbsp;|&nbsp;
+    Cls AUC: <code>{auc_val:.3f}</code>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
