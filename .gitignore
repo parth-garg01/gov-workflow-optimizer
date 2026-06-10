@@ -18,6 +18,7 @@ env/
 # Large generated data files — regenerate with data_gen.py
 # Keep feature importance CSVs (small, useful for review)
 data/synthetic_files.csv
+data/government_files.csv
 data/predictions.csv
 data/predictions.db
 data/new_files.csv
