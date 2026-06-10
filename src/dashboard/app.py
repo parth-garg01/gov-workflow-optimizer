@@ -520,6 +520,29 @@ with tab_overview:
             for k, v in stats.items():
                 st.markdown(f"**{k}:** {v}")
 
+        # --- File type performance sunburst ---
+        st.markdown('<p class="section-header">Delay Rate by File Type & Priority</p>', unsafe_allow_html=True)
+        ftype_agg = (
+            df_f.groupby(["file_type", "priority"])
+            .agg(total=("file_id","count"), delayed=("delayed","sum"))
+            .reset_index()
+        )
+        ftype_agg["delay_rate"] = ftype_agg["delayed"] / ftype_agg["total"] * 100
+        fig_sun = px.sunburst(
+            ftype_agg,
+            path=["file_type", "priority"],
+            values="total",
+            color="delay_rate",
+            color_continuous_scale="RdYlGn_r",
+            hover_data={"delay_rate": ":.1f"},
+        )
+        fig_sun.update_layout(
+            paper_bgcolor="#0f172a", font_color="#e2e8f0",
+            height=340, margin=dict(l=10, r=10, t=20, b=10),
+            coloraxis_showscale=False,
+        )
+        st.plotly_chart(fig_sun, use_container_width=True)
+
         # --- Submission trend over time ---
         st.markdown('<p class="section-header">Monthly Filing Volume & Delay Rate</p>', unsafe_allow_html=True)
         trend = (
