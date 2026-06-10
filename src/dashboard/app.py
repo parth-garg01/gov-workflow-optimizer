@@ -401,11 +401,13 @@ st.markdown('<h1 style="font-size:1.8rem;font-weight:800;color:#f1f5f9;">🏛️
 total, avg_hours, delayed, delay_pct, avg_ratio = compute_kpis(df_f)
 
 c1, c2, c3, c4, c5 = st.columns(5)
-c1.metric("Total Files",       f"{total:,}")
-c2.metric("Avg Processing",    f"{avg_hours:.0f} hrs",  f"{avg_hours/24:.1f} days")
-c3.metric("Delayed Files",     f"{delayed:,}",          f"{delay_pct:.1f}% of total")
-c4.metric("Avg SLA Usage",     f"{avg_ratio*100:.1f}%")
-c5.metric("On-Time Rate",      f"{100-delay_pct:.1f}%")
+overall_delay_pct = round(df["delayed"].astype(int).mean() * 100, 1)
+delta_delay = round(delay_pct - overall_delay_pct, 1)
+c1.metric("Total Files",    f"{total:,}",            f"{total/len(df)*100:.0f}% of dataset")
+c2.metric("Avg Processing", f"{avg_hours:.0f} hrs",  f"{avg_hours/24:.1f} days")
+c3.metric("Delayed Files",  f"{delayed:,}",          f"{delay_pct:.1f}% (overall {overall_delay_pct}%)")
+c4.metric("Avg SLA Usage",  f"{avg_ratio*100:.1f}%", delta=f"{(avg_ratio-0.68)*100:+.1f}% vs baseline")
+c5.metric("On-Time Rate",   f"{100-delay_pct:.1f}%", delta=f"{-delta_delay:+.1f}% vs overall")
 
 # ===========================================================================
 # MAIN TABS
