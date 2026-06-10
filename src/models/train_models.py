@@ -13,8 +13,18 @@
 
 from __future__ import annotations
 
+import warnings
 from datetime import datetime
 from pathlib import Path
+
+# Suppress the sklearn/LightGBM feature-name warning that fires during
+# cross_val_score and permutation_importance (both pass numpy arrays
+# internally, stripping column names — the warning is harmless).
+warnings.filterwarnings(
+    "ignore",
+    message="X does not have valid feature names",
+    category=UserWarning,
+)
 
 import joblib
 import numpy as np
