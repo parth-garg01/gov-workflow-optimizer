@@ -248,7 +248,10 @@ def load_new_files_csv() -> pd.DataFrame:
     try:
         return pd.read_csv(path, parse_dates=["submission_date"])
     except Exception:
-        return pd.read_csv(path)
+        try:
+            return pd.read_csv(path, on_bad_lines="skip")
+        except Exception:
+            return pd.DataFrame()
 
 
 # ---------------------------------------------------------------------------
