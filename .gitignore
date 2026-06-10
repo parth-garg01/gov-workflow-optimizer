@@ -9,8 +9,8 @@ venv/
 .venv/
 env/
 
-# Streamlit cache
-.streamlit/
+# Streamlit — keep config.toml but exclude cache
+.streamlit/cache/
 
 # Trained model binaries (large — regenerate with train_models.py)
 *.pkl
